@@ -1,0 +1,60 @@
+mappings:
+  flake8:
+    OpenSUSELeap153:
+
+  meson:
+    OpenSUSELeap153:
+
+  python3:
+    OpenSUSELeap153: python39-base
+
+  python3-PyYAML:
+    OpenSUSELeap153:
+
+  python3-devel:
+    OpenSUSELeap153: python39-devel
+
+  python3-docutils:
+    OpenSUSELeap153:
+
+  python3-numpy:
+    OpenSUSELeap153:
+
+  python3-opencv:
+    OpenSUSELeap153:
+
+  python3-pillow:
+    OpenSUSELeap153:
+
+  python3-pip:
+    OpenSUSELeap153: python39-pip
+
+  python3-pillow:
+    OpenSUSELeap153:
+
+  python3-selinux:
+    OpenSUSELeap153:
+
+  python3-setuptools:
+    OpenSUSELeap153: python39-setuptools
+
+  python3-sphinx:
+    OpenSUSELeap153:
+
+  python3-sphinx-rtd-theme:
+    OpenSUSELeap153:
+
+  python3-venv:
+    OpenSUSELeap153: python39-base
+
+  python3-wheel:
+    OpenSUSELeap153: python39-pip
+
+pypi_mappings:
+  # Request more recent version
+  meson:
+    default: meson==0.63.2
+
+  # Drop packages that need devel headers
+  python3-numpy:
+    OpenSUSELeap153:

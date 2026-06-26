@@ -1,0 +1,10 @@
+break console_init
+break start_kernel
+break da850_init
+break davinci_psc_config
+break schedule
+break davinci_common_init
+break da850_evm_console_init
+break da850_evm_init
+break acquire_console_sem
+break con_init
