@@ -22,6 +22,7 @@
 #include "hw/irq.h"
 #include "hw/boards.h"
 #include "hw/block/flash.h"
+#include "chardev/char.h"
 #include "qemu/error-report.h"
 #include "hw/sysbus.h"
 #include "hw/char/serial.h"
@@ -499,9 +500,10 @@ sysbus_mmio_map(aintc_bus, 0, 0xFFFEE000);
 sysbus_connect_irq(aintc_bus, 0, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
 
 
-    serial_mm_init(get_system_memory(), 0x01c42000, 2, qdev_get_gpio_in(aintc, 25), 115200, serial_hd(2), DEVICE_LITTLE_ENDIAN);
-    serial_mm_init(get_system_memory(), 0x01d0c000, 2, qdev_get_gpio_in(aintc, 53), 115200, serial_hd(0), DEVICE_LITTLE_ENDIAN);
-    serial_mm_init(get_system_memory(), 0x01d0d000, 2, qdev_get_gpio_in(aintc, 61), 115200, serial_hd(1), DEVICE_LITTLE_ENDIAN);
+    /* DA850 console is UART1, which Linux exposes as ttyS1 here. */
+    serial_mm_init(get_system_memory(), 0x01c42000, 2, qdev_get_gpio_in(aintc, 25), 115200, serial_hd(0), DEVICE_LITTLE_ENDIAN);
+    serial_mm_init(get_system_memory(), 0x01d0c000, 2, qdev_get_gpio_in(aintc, 53), 115200, serial_hd(1), DEVICE_LITTLE_ENDIAN);
+    serial_mm_init(get_system_memory(), 0x01d0d000, 2, qdev_get_gpio_in(aintc, 61), 115200, serial_hd(2), DEVICE_LITTLE_ENDIAN);
 
     /* vpb_init の中に追加 */
     MemoryRegion *syscfg0 = g_new(MemoryRegion, 1);
@@ -524,11 +526,12 @@ sysbus_mmio_map(SYS_BUS_DEVICE(psc1), 0, 0x01e27000);
     memory_region_init_io(psc1, NULL, &da850_psc_ops, NULL, "da850.psc1", 0x1000);
     memory_region_add_subregion(get_system_memory(), 0x01E27000, psc1);
     */
+   /*
     DeviceState *timer0 = qdev_new("da850-timer");
     SysBusDevice *tbus0 = SYS_BUS_DEVICE(timer0);
     
     sysbus_realize_and_unref(tbus0, &error_fatal);
-    sysbus_mmio_map(tbus0, 0, 0x01C20000);
+    sysbus_mmio_map(tbus0, 0, 0x01C20000);*/
 
 /* ================================================================= *
      * 正しい MUSB (USBコア) の生成、MMIO転送、および割り込み配線 (決定版)
@@ -578,17 +581,32 @@ sysbus_mmio_map(SYS_BUS_DEVICE(psc1), 0, 0x01e27000);
 // タイマーの出力を AINTC の 21, 22, 24 全てに突っ込む
 //qemu_irq aintc_21 = qdev_get_gpio_in(aintc, 21);
 //qemu_irq aintc_22 = qdev_get_gpio_in(aintc, 22);
-qemu_irq aintc_24 = qdev_get_gpio_in(aintc, 21);
+//qemu_irq aintc_24 = qdev_get_gpio_in(aintc, 21);
 
 // sysbus_connect_irq は 1対1 なので、手動で分配するか、
 // とりあえずカーネルが今欲しがっている 24番に繋ぎ替える
-sysbus_connect_irq(tbus0, 0, aintc_24); 
+//sysbus_connect_irq(tbus0, 0, aintc_24); 
+
+DeviceState *timer0 = qdev_new("da850-timer");
+SysBusDevice *tbus0 = SYS_BUS_DEVICE(timer0);
+
+sysbus_realize_and_unref(tbus0, &error_fatal);
+sysbus_mmio_map(tbus0, 0, 0x01C20000);
+
+/* timer0: irq[0]=TINT12(bottom, clockevent) -> AINTC 21
+ *         irq[1]=TINT34(top, clocksource)   -> AINTC 22 */
+sysbus_connect_irq(tbus0, 0, qdev_get_gpio_in(aintc, 21));
+sysbus_connect_irq(tbus0, 1, qdev_get_gpio_in(aintc, 22));
+
+/* 旧: qemu_irq aintc_24 = ...  sysbus_connect_irq(tbus0, 0, aintc_24); ← 削除
+ * 旧: qdev_connect_gpio_out_named(aintc, "timer_ack", ...);           ← 削除
+ */
 
 /* AINTC 側の SICR 処理も 24 に対応させる */
 // aintc.c の SICR (0x24) の case をこうする：
 // if (val == 21 || val == 22 || val == 24) { qemu_set_irq(s->timer_ack_out, 0); }
-    qdev_connect_gpio_out_named(aintc, "timer_ack", 0,
-                                qdev_get_gpio_in(timer0, 0));
+ //   qdev_connect_gpio_out_named(aintc, "timer_ack", 0,
+   //                             qdev_get_gpio_in(timer0, 0));
 /*
     DeviceState *timer1 = qdev_new("da850-timer");
     SysBusDevice *tbus1 = SYS_BUS_DEVICE(timer1);

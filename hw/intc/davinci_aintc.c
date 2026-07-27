@@ -344,9 +344,49 @@ static uint64_t aintc_read(void *opaque, hwaddr addr, unsigned size)
     return ret;
 }
 
+#if 0
 static void aintc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     AINTCState *s = opaque;
+
+    switch (addr) {
+    case 0x024: // SICR (Clear)
+        if (val < NR_IRQS) {
+            s->pending[val] = false;
+            
+            /* ★重要：ACK通知を送り、CPU線を一旦強制的に下げる */
+            qemu_set_irq(s->cpu_irq, 0); 
+            if (val == 21 || val == 22 || val == 24) {
+                qemu_set_irq(s->timer_ack_out, 1);
+                qemu_set_irq(s->timer_ack_out, 0);
+            }
+        }
+        break;
+
+    case 0x028: // EISR (Enable Set)
+        if (val < NR_IRQS) s->enable[val] = true;
+        break;
+
+    case 0x02C: // EICR (Enable Clear)
+        if (val < NR_IRQS) s->enable[val] = false;
+        break;
+
+    case 0x010: // GER
+        s->global_enable = (val & 1);
+        break;
+    }
+    aintc_update(s);
+}
+#endif
+
+static void aintc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    AINTCState *s = opaque;
+
+    //if (!(addr == 0x024 && val == 21)) {
+        fprintf(stderr, "[AINTC WRITE] addr=0x%03lx val=0x%08lx (GER=%d)\n",
+                (unsigned long)addr, (unsigned long)val, s->global_enable);
+    //}
 
     switch (addr) {
     case 0x024: // SICR (Clear)

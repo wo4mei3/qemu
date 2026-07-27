@@ -133,6 +133,12 @@ static void da850_psc_reset(DeviceState *dev)
         s->mdctl[i] = PSC_STATE_SWRSTDISABLE;
         s->mdstat[i] = PSC_STATE_SWRSTDISABLE;
     }
+
+    /* Booting the kernel directly skips bootloader PSC setup, so keep the
+     * console UART enabled by default.
+     */
+    s->mdctl[20] = PSC_STATE_ENABLE;
+    s->mdstat[20] = PSC_STATE_ENABLE;
 }
 
 static void da850_psc_init(Object *obj)

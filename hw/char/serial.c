@@ -271,6 +271,7 @@ static void serial_xmit(SerialState *s)
                 }
             }
         }
+
         s->tsr_retry = 0;
 
         /* Transmit another byte if it is already available. It is only
