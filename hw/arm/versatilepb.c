@@ -18,6 +18,7 @@
 #include "sysemu/sysemu.h"
 #include "hw/pci/pci.h"
 #include "hw/i2c/i2c.h"
+#include "hw/ssi/ssi.h"
 #include "hw/i2c/arm_sbcon_i2c.h"
 #include "hw/irq.h"
 #include "hw/boards.h"
@@ -176,7 +177,8 @@ static void vpb_sic_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
-/* ファイルの上部に追加 */
+static uint32_t da850_syscfg_cfgchip2 = 0;
+
 static uint64_t da850_syscfg_read(void *opaque, hwaddr offset, unsigned size)
 {
     switch (offset) {
@@ -185,6 +187,13 @@ static uint64_t da850_syscfg_read(void *opaque, hwaddr offset, unsigned size)
     case 0x18:
         return 0x1B7D102F;
     case 0x17c: /* CFGCHIP0 */
+        return 0;
+    case 0x184: /* CFGCHIP2 */
+        /* USB PHY clock is always "good" in this model, and the PLL is
+         * always reported as locked, so ohci_da8xx_clock()'s busy-wait
+         * loop on CFGCHIP2_PHYCLKGD completes immediately. */
+        return da850_syscfg_cfgchip2 | (1u << 17) /* CFGCHIP2_PHYCLKGD */
+                                      | (1u << 6)  /* CFGCHIP2_PHY_PLLON echoed back */;
     case 0x188: /* CFGCHIP3 */
         return 0;
     default:
@@ -192,10 +201,16 @@ static uint64_t da850_syscfg_read(void *opaque, hwaddr offset, unsigned size)
     }
 }
 
-/* 1. SYSCFG用の空のwriteを追加 */
 static void da850_syscfg_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
-    /* 何もしない */
+    switch (offset) {
+    case 0x184: /* CFGCHIP2 */
+        da850_syscfg_cfgchip2 = (uint32_t)value;
+        break;
+    default:
+        /* other SYSCFG registers: not modeled, ignore writes */
+        break;
+    }
 }
 
 /* 2. opsに登録 */
@@ -615,6 +630,157 @@ sysbus_connect_irq(tbus0, 1, qdev_get_gpio_in(aintc, 22));
     sysbus_mmio_map(tbus1, 0, 0x01C21000);
     sysbus_connect_irq(tbus1, 0,
     qdev_get_gpio_in(aintc, 23));*/
+#if 0
+/* EDMA3 CC0 */
+DeviceState *edma = qdev_new("da850-edma");
+sysbus_realize_and_unref(SYS_BUS_DEVICE(edma), &error_fatal);
+sysbus_mmio_map(SYS_BUS_DEVICE(edma), 0, 0x01c00000);
+sysbus_connect_irq(SYS_BUS_DEVICE(edma), 0, qdev_get_gpio_in(aintc, 11)); /* IRQ_DA8XX_CCINT0 */
+
+/* SPI0 + m25p80 flash */
+DeviceState *spi0 = qdev_new("da850-spi");
+sysbus_realize_and_unref(SYS_BUS_DEVICE(spi0), &error_fatal);
+sysbus_mmio_map(SYS_BUS_DEVICE(spi0), 0, 0x01f0e000); /* SPI0の物理アドレス、要確認 */
+sysbus_connect_irq(SYS_BUS_DEVICE(spi0), 0, qdev_get_gpio_in(aintc, 20)); /* IRQ_DA8XX_SPINT0 */
+DeviceState *flash = qdev_new("s25sl12801");
+
+SSIBus *spi0_bus =
+    (SSIBus *)qdev_get_child_bus(spi0, "spi");
+
+qdev_realize_and_unref(flash, BUS(spi0_bus), &error_fatal);
+
+qemu_irq cs_line =
+    qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0);
+
+sysbus_connect_irq(SYS_BUS_DEVICE(spi0), 1, cs_line);
+#endif
+
+/*
+ * EDMA
+ */
+DeviceState *edma =
+    qdev_new("da850-edma");
+
+sysbus_realize_and_unref(
+    SYS_BUS_DEVICE(edma),
+    &error_fatal
+);
+
+sysbus_mmio_map(
+    SYS_BUS_DEVICE(edma),
+    0,
+    0x01c00000
+);
+
+sysbus_connect_irq(
+    SYS_BUS_DEVICE(edma),
+    0,
+    qdev_get_gpio_in(aintc, 11)
+); /* IRQ_DA8XX_CCINT0 */
+
+
+/*
+ * SPI0
+ */
+DeviceState *spi0 =
+    qdev_new("da850-spi");
+
+sysbus_realize_and_unref(
+    SYS_BUS_DEVICE(spi0),
+    &error_fatal
+);
+
+sysbus_mmio_map(
+    SYS_BUS_DEVICE(spi0),
+    0,
+    0x01f0e000
+); /* SPI0 */
+
+
+/*
+ * SPI interrupt
+ *
+ * sysbus IRQ 0 remains the SPI interrupt.
+ */
+sysbus_connect_irq(
+    SYS_BUS_DEVICE(spi0),
+    0,
+    qdev_get_gpio_in(aintc, 20)
+); /* IRQ_DA8XX_SPINT0 */
+
+
+/*
+ * SPI0 flash
+ */
+DeviceState *flash =
+    qdev_new("s25sl12801");
+
+SSIBus *spi0_bus =
+    (SSIBus *)qdev_get_child_bus(
+        spi0,
+        "spi"
+    );
+
+qdev_realize_and_unref(
+    flash,
+    BUS(spi0_bus),
+    &error_fatal
+);
+
+
+/*
+ * Flash CS0
+ *
+ * sysbus IRQ 1 of our DA850 SPI model
+ * is still CS0.
+ */
+qemu_irq cs_line =
+    qdev_get_gpio_in_named(
+        flash,
+        SSI_GPIO_CS,
+        0
+    );
+
+sysbus_connect_irq(
+    SYS_BUS_DEVICE(spi0),
+    1,
+    cs_line
+);
+
+
+/*
+ * ============================================================
+ * SPI0 DMA TX request -> EDMA event 15
+ * ============================================================
+ *
+ * SPI:
+ *
+ *     "dma-tx"
+ *          |
+ *          v
+ *
+ * EDMA:
+ *
+ *     event[15]
+ *
+ * Linux configured:
+ *
+ *     SPI0 TX = EDMA channel 15
+ */
+/*
+qemu_irq edma_spi0_tx_event =
+    qdev_get_gpio_in_named(
+        edma,
+        "event",
+        15
+    );
+
+qdev_connect_gpio_out_named(
+    spi0,
+    "dma-tx",
+    0,
+    edma_spi0_tx_event
+);*/
 
 #if 0
     /* 2. vpb_init の中に追加 */

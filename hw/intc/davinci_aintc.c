@@ -384,8 +384,8 @@ static void aintc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     AINTCState *s = opaque;
 
     //if (!(addr == 0x024 && val == 21)) {
-        fprintf(stderr, "[AINTC WRITE] addr=0x%03lx val=0x%08lx (GER=%d)\n",
-                (unsigned long)addr, (unsigned long)val, s->global_enable);
+        //fprintf(stderr, "[AINTC WRITE] addr=0x%03lx val=0x%08lx (GER=%d)\n",
+         //       (unsigned long)addr, (unsigned long)val, s->global_enable);
     //}
 
     switch (addr) {
@@ -411,6 +411,8 @@ static void aintc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
 
     case 0x010: // GER
+    fprintf(stderr, "AINTC: GER WRITE = %d\n", (int)(val & 1));
+
         s->global_enable = (val & 1);
         break;
     }

@@ -285,9 +285,9 @@ static void sub_schedule_next(DA850SubTimer *s)
     if (remaining_ns == 0) {
         remaining_ns = 1;
     }
-  fprintf(stderr, "[TIMER SCHED] period=%u cur=%lu remaining_ns=%lu fire_at=%ld\n",
-            s->period, (unsigned long)cur, (unsigned long)remaining_ns,
-            (long)(now + (int64_t)remaining_ns));
+  //fprintf(stderr, "[TIMER SCHED] period=%u cur=%lu remaining_ns=%lu fire_at=%ld\n",
+  //          s->period, (unsigned long)cur, (unsigned long)remaining_ns,
+ //           (long)(now + (int64_t)remaining_ns));
     timer_mod(s->qtimer, now + (int64_t)remaining_ns);
 }
 
@@ -330,7 +330,7 @@ static void sub_update_running(DA850SubTimer *s)
 static void sub_timer_cb(void *opaque)
 {
     DA850SubTimer *s = opaque;
-fprintf(stderr, "[TIMER FIRE] enamode=%d\n", s->enamode);
+//fprintf(stderr, "[TIMER FIRE] enamode=%d\n", s->enamode);
 
     if (!s->running) {
         return;
@@ -425,8 +425,8 @@ static void da850_timer_write(void *opaque, hwaddr addr,
 {
     DA850TimerState *s = opaque;
 
-        fprintf(stderr, "[TIMER WRITE] addr=0x%02lx val=0x%08lx\n",
-            (unsigned long)addr, (unsigned long)val);
+        //fprintf(stderr, "[TIMER WRITE] addr=0x%02lx val=0x%08lx\n",
+         //       (unsigned long)addr, (unsigned long)val);
 
     switch (addr) {
     case REG_TIM12:
