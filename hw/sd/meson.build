@@ -1,5 +1,6 @@
 softmmu_ss.add(when: 'CONFIG_PL181', if_true: files('pl181.c'))
 softmmu_ss.add(when: 'CONFIG_SD', if_true: files('sd.c', 'core.c', 'sdmmc-internal.c'))
+softmmu_ss.add(when: 'CONFIG_SD', if_true: files('da850_mmc.c'))
 softmmu_ss.add(when: 'CONFIG_SDHCI', if_true: files('sdhci.c'))
 softmmu_ss.add(when: 'CONFIG_SDHCI_PCI', if_true: files('sdhci-pci.c'))
 softmmu_ss.add(when: 'CONFIG_SSI_SD', if_true: files('ssi-sd.c'))

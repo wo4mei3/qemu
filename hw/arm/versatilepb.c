@@ -220,6 +220,105 @@ static const MemoryRegionOps da850_syscfg_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+typedef struct DA850SimplePeripherals {
+    MemoryRegion gpio_mmio;
+    MemoryRegion timer_mmio;
+    MemoryRegion ehrpwm_mmio;
+    MemoryRegion ecap0_mmio;
+    MemoryRegion ecap1_mmio;
+    uint32_t gpio[0xd8 / 4];
+    uint32_t pwm[0x2854 / 4];
+    uint64_t timer_start_ns;
+} DA850SimplePeripherals;
+
+static uint64_t da850_gpio_read(void *opaque, hwaddr offset, unsigned size)
+{
+    DA850SimplePeripherals *s = opaque;
+    unsigned bank = offset / 0x28;
+    unsigned reg = offset % 0x28;
+
+    if (bank < 5 && reg == 0x20) {
+        return s->gpio[bank * 0x28 / 4 + 0x14 / 4];
+    }
+    if (offset < sizeof(s->gpio)) {
+        return s->gpio[offset / 4];
+    }
+    return 0;
+}
+
+static void da850_gpio_write(void *opaque, hwaddr offset,
+                             uint64_t value, unsigned size)
+{
+    DA850SimplePeripherals *s = opaque;
+    unsigned bank = offset / 0x28;
+    unsigned reg = offset % 0x28;
+    unsigned index = bank * 0x28 / 4 + 0x14 / 4;
+
+    if (bank < 5 && reg == 0x18) {
+        s->gpio[index] |= value;
+    } else if (bank < 5 && reg == 0x1c) {
+        s->gpio[index] &= ~value;
+    } else if (offset < sizeof(s->gpio)) {
+        s->gpio[offset / 4] = value;
+    }
+}
+
+static const MemoryRegionOps da850_gpio_ops = {
+    .read = da850_gpio_read,
+    .write = da850_gpio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static uint64_t da850_timer_read(void *opaque, hwaddr offset, unsigned size)
+{
+    DA850SimplePeripherals *s = opaque;
+    uint64_t elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                       s->timer_start_ns;
+
+    if (offset == 5 * 4) {
+        return (elapsed * 24 / 1000) & 0xffffffff;
+    }
+    return 0;
+}
+
+static void da850_timer_write(void *opaque, hwaddr offset,
+                              uint64_t value, unsigned size)
+{
+    /* Timer control writes are accepted; the counter is free-running. */
+}
+
+static const MemoryRegionOps da850_timer_ops = {
+    .read = da850_timer_read,
+    .write = da850_timer_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static uint64_t da850_pwm_read(void *opaque, hwaddr offset, unsigned size)
+{
+    DA850SimplePeripherals *s = opaque;
+
+    if (offset < sizeof(s->pwm)) {
+        return s->pwm[offset / 4];
+    }
+    return 0;
+}
+
+static void da850_pwm_write(void *opaque, hwaddr offset,
+                            uint64_t value, unsigned size)
+{
+    DA850SimplePeripherals *s = opaque;
+
+    if (offset < sizeof(s->pwm)) {
+        s->pwm[offset / 4] = value;
+    }
+}
+
+static const MemoryRegionOps da850_pwm_ops = {
+    .read = da850_pwm_read,
+    .write = da850_pwm_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 /* PSCのオフセット定義 */
 #define PSC_PTSTAT      0x0128  /* Power Transition Status */
 #define PSC_EPCPR       0x0070  /* External Power Control Status */
@@ -348,6 +447,9 @@ static const MemoryRegionOps da850_psc_ops = {
 typedef struct DA850USBState {
     MemoryRegion usb_mmio;
     MUSBState *musb;
+    uint32_t ctrl;
+    uint32_t intr_src;
+    uint32_t intr_mask;
 } DA850USBState;
 
 
@@ -355,6 +457,20 @@ typedef struct DA850USBState {
 static uint64_t da850_usb_read(void *opaque, hwaddr addr, unsigned size)
 {
     DA850USBState *s = opaque;
+
+    switch (addr) {
+    case 0x00: return 0x00000100;
+    case 0x04: return s->ctrl;
+    case 0x08: return 1;
+    case 0x20: return s->intr_src;
+    case 0x2c: return s->intr_mask;
+    case 0x38: return s->intr_src & s->intr_mask;
+    default: break;
+    }
+    if (addr < 0x400) {
+        return 0;
+    }
+    addr -= 0x400;
     switch (size) {
     case 1: return musb_read[0](s->musb, addr);
     case 2: return musb_read[1](s->musb, addr);
@@ -366,6 +482,25 @@ static uint64_t da850_usb_read(void *opaque, hwaddr addr, unsigned size)
 static void da850_usb_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     DA850USBState *s = opaque;
+
+    switch (addr) {
+    case 0x04:
+        s->ctrl = val;
+        if (val & 1) {
+            musb_reset(s->musb);
+        }
+        return;
+    case 0x24: s->intr_src |= val; return;
+    case 0x28: s->intr_src &= ~val; return;
+    case 0x30: s->intr_mask |= val; return;
+    case 0x34: s->intr_mask &= ~val; return;
+    case 0x3c: s->intr_src = 0; return;
+    default: break;
+    }
+    if (addr < 0x400) {
+        return;
+    }
+    addr -= 0x400;
     switch (size) {
     case 1: musb_write[0](s->musb, addr, val); break;
     case 2: musb_write[1](s->musb, addr, val); break;
@@ -524,6 +659,34 @@ sysbus_connect_irq(aintc_bus, 0, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
     MemoryRegion *syscfg0 = g_new(MemoryRegion, 1);
     memory_region_init_io(syscfg0, NULL, &da850_syscfg_ops, NULL, "da850-syscfg0", 0x1000);
     memory_region_add_subregion(get_system_memory(), 0x01C14000, syscfg0);
+
+    DA850SimplePeripherals *simple_peripherals = g_new0(DA850SimplePeripherals, 1);
+    simple_peripherals->timer_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    memory_region_init_io(&simple_peripherals->gpio_mmio, OBJECT(machine),
+                          &da850_gpio_ops, simple_peripherals,
+                          "da850-gpio", 0xd8);
+    memory_region_add_subregion(get_system_memory(), 0x01e26000,
+                                &simple_peripherals->gpio_mmio);
+    memory_region_init_io(&simple_peripherals->timer_mmio, OBJECT(machine),
+                          &da850_timer_ops, simple_peripherals,
+                          "da850-timer64p3", 0x80);
+    memory_region_add_subregion(get_system_memory(), 0x01f0d000,
+                                &simple_peripherals->timer_mmio);
+    memory_region_init_io(&simple_peripherals->ehrpwm_mmio, OBJECT(machine),
+                          &da850_pwm_ops, simple_peripherals,
+                          "da850-ehrpwm", 0x2854);
+    memory_region_add_subregion(get_system_memory(), 0x01f02000,
+                                &simple_peripherals->ehrpwm_mmio);
+    memory_region_init_io(&simple_peripherals->ecap0_mmio, OBJECT(machine),
+                          &da850_pwm_ops, simple_peripherals,
+                          "da850-ecap0", 0x60);
+    memory_region_add_subregion(get_system_memory(), 0x01f06000,
+                                &simple_peripherals->ecap0_mmio);
+    memory_region_init_io(&simple_peripherals->ecap1_mmio, OBJECT(machine),
+                          &da850_pwm_ops, simple_peripherals,
+                          "da850-ecap1", 0x60);
+    memory_region_add_subregion(get_system_memory(), 0x01f07000,
+                                &simple_peripherals->ecap1_mmio);
 /*
         MemoryRegion *psc0 = g_new(MemoryRegion, 1);
     memory_region_init_io(psc0, NULL, &da850_psc_ops, NULL, "da850.psc0", 0x1000);
@@ -535,6 +698,25 @@ sysbus_mmio_map(SYS_BUS_DEVICE(psc), 0, 0x01c10000);
 DeviceState *psc1 = qdev_new("da850-psc");
 sysbus_realize_and_unref(SYS_BUS_DEVICE(psc1), &error_fatal);
 sysbus_mmio_map(SYS_BUS_DEVICE(psc1), 0, 0x01e27000);
+
+DeviceState *i2c0 = qdev_new("da850-i2c");
+sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c0), &error_fatal);
+sysbus_mmio_map(SYS_BUS_DEVICE(i2c0), 0, 0x01c22000);
+sysbus_connect_irq(SYS_BUS_DEVICE(i2c0), 0, qdev_get_gpio_in(aintc, 15));
+
+    DeviceState *mmc = qdev_new("da850-mmc");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(mmc), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(mmc), 0, 0x01c40000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(mmc), 0, qdev_get_gpio_in(aintc, 16));
+
+    DeviceState *sdcard = qdev_new(TYPE_SD_CARD);
+    dinfo = drive_get(IF_SD, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive_err(sdcard, "drive", blk_by_legacy_dinfo(dinfo),
+                                &error_fatal);
+    }
+    qdev_realize_and_unref(sdcard, qdev_get_child_bus(mmc, "sd-bus"),
+                           &error_fatal);
 
     /* PSC1 (UART2 等の電源管理用) 
     MemoryRegion *psc1 = g_new(MemoryRegion, 1);
