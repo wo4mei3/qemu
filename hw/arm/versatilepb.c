@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "cpu.h"
 #include "hw/sysbus.h"
@@ -862,72 +863,29 @@ sysbus_connect_irq(
 
 
 /*
- * SPI0
+ * SPI0 (Flash m25p80 / s25sl12801)
+ * Physical address: 0x01c41000, IRQ: 56 (SPINT0)
  */
-DeviceState *spi0 =
-    qdev_new("da850-spi");
+DeviceState *spi0 = qdev_new("da850-spi");
+sysbus_realize_and_unref(SYS_BUS_DEVICE(spi0), &error_fatal);
+sysbus_mmio_map(SYS_BUS_DEVICE(spi0), 0, 0x01c41000);
+sysbus_connect_irq(SYS_BUS_DEVICE(spi0), 0, qdev_get_gpio_in(aintc, 56)); /* IRQ_DA8XX_SPINT0 */
 
-sysbus_realize_and_unref(
-    SYS_BUS_DEVICE(spi0),
-    &error_fatal
-);
+DeviceState *flash = qdev_new("s25sl12801");
+SSIBus *spi0_bus = (SSIBus *)qdev_get_child_bus(spi0, "spi");
+qdev_realize_and_unref(flash, BUS(spi0_bus), &error_fatal);
 
-sysbus_mmio_map(
-    SYS_BUS_DEVICE(spi0),
-    0,
-    0x01f0e000
-); /* SPI0 */
-
+qemu_irq cs_line0 = qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0);
+sysbus_connect_irq(SYS_BUS_DEVICE(spi0), 1, cs_line0);
 
 /*
- * SPI interrupt
- *
- * sysbus IRQ 0 remains the SPI interrupt.
+ * SPI1 (Display ST7586 LCD)
+ * Physical address: 0x01f0e000, IRQ: 20 (SPINT1)
  */
-sysbus_connect_irq(
-    SYS_BUS_DEVICE(spi0),
-    0,
-    qdev_get_gpio_in(aintc, 20)
-); /* IRQ_DA8XX_SPINT0 */
-
-
-/*
- * SPI0 flash
- */
-DeviceState *flash =
-    qdev_new("s25sl12801");
-
-SSIBus *spi0_bus =
-    (SSIBus *)qdev_get_child_bus(
-        spi0,
-        "spi"
-    );
-
-qdev_realize_and_unref(
-    flash,
-    BUS(spi0_bus),
-    &error_fatal
-);
-
-
-/*
- * Flash CS0
- *
- * sysbus IRQ 1 of our DA850 SPI model
- * is still CS0.
- */
-qemu_irq cs_line =
-    qdev_get_gpio_in_named(
-        flash,
-        SSI_GPIO_CS,
-        0
-    );
-
-sysbus_connect_irq(
-    SYS_BUS_DEVICE(spi0),
-    1,
-    cs_line
-);
+DeviceState *spi1 = qdev_new("da850-spi");
+sysbus_realize_and_unref(SYS_BUS_DEVICE(spi1), &error_fatal);
+sysbus_mmio_map(SYS_BUS_DEVICE(spi1), 0, 0x01f0e000);
+sysbus_connect_irq(SYS_BUS_DEVICE(spi1), 0, qdev_get_gpio_in(aintc, 20)); /* IRQ_DA8XX_SPINT1 */
 
 
 /*
@@ -1081,7 +1039,7 @@ qdev_connect_gpio_out_named(
     versatile_binfo.ram_size = machine->ram_size;
     /* Ensure the kernel command line from -append is forwarded */
     versatile_binfo.kernel_cmdline = machine->kernel_cmdline;
-    versatile_binfo.board_id = 0x86d;
+    versatile_binfo.board_id = board_id ? board_id : 0x86d;
     arm_load_kernel(cpu, machine, &versatile_binfo);
 }
 
@@ -1093,6 +1051,11 @@ static void vpb_init(MachineState *machine)
 static void vab_init(MachineState *machine)
 {
     versatile_init(machine, 0x25e);
+}
+
+static void ev3_init(MachineState *machine)
+{
+    versatile_init(machine, 0x86d);
 }
 
 static void versatilepb_class_init(ObjectClass *oc, void *data)
@@ -1131,10 +1094,37 @@ static const TypeInfo versatileab_type = {
     .class_init = versatileab_class_init,
 };
 
+static void ev3_class_init(ObjectClass *oc, void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "LEGO MINDSTORMS EV3 (AM1808/DA850)";
+    mc->init = ev3_init;
+    mc->block_default_type = IF_SD;
+    mc->ignore_memory_transaction_failures = true;
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm926");
+    mc->default_ram_id = "ev3.ram";
+    mc->default_ram_size = 64 * MiB;
+}
+
+static const TypeInfo ev3_type = {
+    .name = MACHINE_TYPE_NAME("ev3"),
+    .parent = TYPE_MACHINE,
+    .class_init = ev3_class_init,
+};
+
+static const TypeInfo legoev3_type = {
+    .name = MACHINE_TYPE_NAME("legoev3"),
+    .parent = TYPE_MACHINE,
+    .class_init = ev3_class_init,
+};
+
 static void versatile_machine_init(void)
 {
     type_register_static(&versatilepb_type);
     type_register_static(&versatileab_type);
+    type_register_static(&ev3_type);
+    type_register_static(&legoev3_type);
 }
 
 type_init(versatile_machine_init)
