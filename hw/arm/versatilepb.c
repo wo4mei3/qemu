@@ -250,6 +250,7 @@ typedef struct DA850SimplePeripherals {
     uint8_t pwm1[0x2854];
     uint64_t timer_start_ns;
     qemu_irq lcd_cd;
+    qemu_irq lcd_led[4];
     EV3SoundState sound;
 } DA850SimplePeripherals;
 
@@ -391,6 +392,24 @@ static void da850_gpio_write(void *opaque, hwaddr offset,
     /* GPIO2_11 (pin 43: bank 1, bit 11) is ST7586 A0 (D/C) */
     if (bank == 1 && s->lcd_cd) {
         qemu_set_irq(s->lcd_cd, (s->gpio[1 * 0x28 / 4 + 0x14 / 4] >> 11) & 1);
+    }
+
+    /*
+     * EV3 Status LEDs (d_ui.ko FINALB_UiLedPin):
+     *   Pin 108 (bank 3, bit 12): Red Left   (Entry 0)
+     *   Pin 33  (bank 1, bit 1):  Green Left (Entry 1)
+     *   Pin 109 (bank 3, bit 13): Red Right  (Entry 2)
+     *   Pin 103 (bank 3, bit 7):  Green Right(Entry 3)
+     */
+    if (s->lcd_led[0] && (bank == 1 || bank == 3)) {
+        bool red_l   = (s->gpio[3 * 0x28 / 4 + 0x14 / 4] >> 12) & 1;
+        bool green_l = (s->gpio[1 * 0x28 / 4 + 0x14 / 4] >> 1)  & 1;
+        bool red_r   = (s->gpio[3 * 0x28 / 4 + 0x14 / 4] >> 13) & 1;
+        bool green_r = (s->gpio[3 * 0x28 / 4 + 0x14 / 4] >> 7)  & 1;
+        qemu_set_irq(s->lcd_led[0], red_l);
+        qemu_set_irq(s->lcd_led[1], green_l);
+        qemu_set_irq(s->lcd_led[2], red_r);
+        qemu_set_irq(s->lcd_led[3], green_r);
     }
 
     /* Pin 111 (bank 3, bit 15) and Pin 161 (bank 5, bit 1): EV3 Audio Enable */
@@ -1096,6 +1115,9 @@ qdev_realize_and_unref(lcd, BUS(spi1_bus), &error_fatal);
 qemu_irq cs_line1 = qdev_get_gpio_in_named(lcd, SSI_GPIO_CS, 0);
 sysbus_connect_irq(SYS_BUS_DEVICE(spi1), 1, cs_line1);
 simple_peripherals->lcd_cd = qdev_get_gpio_in(lcd, 0);
+for (int i = 0; i < 4; i++) {
+    simple_peripherals->lcd_led[i] = qdev_get_gpio_in_named(lcd, "ev3-led", i);
+}
 
 qemu_irq *ev3_btn_irqs = qemu_allocate_irqs(ev3_gpio_button_irq,
                                             simple_peripherals, 6);

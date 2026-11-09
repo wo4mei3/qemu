@@ -14,6 +14,7 @@
 #include "ui/input.h"
 #include "qom/object.h"
 #include <zlib.h>
+#include <math.h>
 
 #include "ev3_faceplate_data.h"
 #include "ev3_faceplate_btnmap.h"
@@ -102,6 +103,12 @@ struct st7586_state {
     uint32_t active_buttons;
 
     uint8_t ddram[ST7586_ROWS * ST7586_COLS];
+
+    /* Status LEDs: Left (Red/Green), Right (Red/Green) */
+    uint8_t led_red_left;
+    uint8_t led_green_left;
+    uint8_t led_red_right;
+    uint8_t led_green_right;
 
     /* Uncompressed RGB24 base faceplate and button hit-map */
     uint8_t bg_rgb[WIN_VIEW_H * WIN_VIEW_W * 3];
@@ -457,7 +464,34 @@ static void st7586_update_display(void *opaque)
     base = surface_data(surface);
     stride = surface_stride(surface);
 
-    /* 1. Blit photo-real EV3 brick faceplate + button highlight */
+    /* Determine Left / Right LED glow color */
+    int led_l_r = 0, led_l_g = 0, led_l_b = 0;
+    int led_r_r = 0, led_r_g = 0, led_r_b = 0;
+    bool has_led_l = false, has_led_r = false;
+
+    if (s->led_red_left && s->led_green_left) {
+        led_l_r = 255; led_l_g = 140; led_l_b = 20; /* Orange */
+        has_led_l = true;
+    } else if (s->led_green_left) {
+        led_l_r = 40; led_l_g = 255; led_l_b = 60;  /* Green */
+        has_led_l = true;
+    } else if (s->led_red_left) {
+        led_l_r = 255; led_l_g = 30; led_l_b = 30;  /* Red */
+        has_led_l = true;
+    }
+
+    if (s->led_red_right && s->led_green_right) {
+        led_r_r = 255; led_r_g = 140; led_r_b = 20; /* Orange */
+        has_led_r = true;
+    } else if (s->led_green_right) {
+        led_r_r = 40; led_r_g = 255; led_r_b = 60;  /* Green */
+        has_led_r = true;
+    } else if (s->led_red_right) {
+        led_r_r = 255; led_r_g = 30; led_r_b = 30;  /* Red */
+        has_led_r = true;
+    }
+
+    /* 1. Blit photo-real EV3 brick faceplate + button highlight + LED glow */
     for (y = 0; y < WIN_VIEW_H; y++) {
         uint8_t *row_dst = base + y * stride;
         const uint8_t *row_bg = &s->bg_rgb[y * WIN_VIEW_W * 3];
@@ -475,6 +509,35 @@ static void st7586_update_display(void *opaque)
                 g = (uint8_t)CLAMP((g * 2 + 0x78) / 3, 0, 255);
                 b = (uint8_t)CLAMP((b * 2 + 0x10) / 3, 0, 255);
             }
+
+            /* Realistic EV3 status LED illumination around button slits */
+            if ((has_led_l || has_led_r) && y >= 469 && y <= 579 && x >= 180 && x <= 356) {
+                if (has_led_l) {
+                    int dx = x - 235;
+                    int dy = y - 524;
+                    int dist2 = dx * dx + dy * dy;
+                    if (dist2 < 55 * 55) {
+                        float dist = sqrtf((float)dist2);
+                        float factor = powf(1.0f - (dist / 55.0f), 1.8f) * 0.85f;
+                        r = (uint8_t)MIN(255, (int)(r * (1.0f - factor * 0.4f) + led_l_r * factor));
+                        g = (uint8_t)MIN(255, (int)(g * (1.0f - factor * 0.4f) + led_l_g * factor));
+                        b = (uint8_t)MIN(255, (int)(b * (1.0f - factor * 0.4f) + led_l_b * factor));
+                    }
+                }
+                if (has_led_r) {
+                    int dx = x - 301;
+                    int dy = y - 524;
+                    int dist2 = dx * dx + dy * dy;
+                    if (dist2 < 55 * 55) {
+                        float dist = sqrtf((float)dist2);
+                        float factor = powf(1.0f - (dist / 55.0f), 1.8f) * 0.85f;
+                        r = (uint8_t)MIN(255, (int)(r * (1.0f - factor * 0.4f) + led_r_r * factor));
+                        g = (uint8_t)MIN(255, (int)(g * (1.0f - factor * 0.4f) + led_r_g * factor));
+                        b = (uint8_t)MIN(255, (int)(b * (1.0f - factor * 0.4f) + led_r_b * factor));
+                    }
+                }
+            }
+
             st7586_put_pixel(row_dst + x * dest_width, bpp, r, g, b);
         }
     }
@@ -532,6 +595,40 @@ static void st7586_cd(void *opaque, int n, int level)
     s->mode = level ? ST7586_DATA : ST7586_CMD;
 }
 
+/*
+ * EV3 Status LED inputs:
+ *   n=0: Red Left
+ *   n=1: Green Left
+ *   n=2: Red Right
+ *   n=3: Green Right
+ */
+static void st7586_led_in(void *opaque, int n, int level)
+{
+    st7586_state *s = ST7586(opaque);
+    int changed = 0;
+    level = level ? 1 : 0;
+
+    switch (n) {
+    case 0:
+        if (s->led_red_left != level) { s->led_red_left = level; changed = 1; }
+        break;
+    case 1:
+        if (s->led_green_left != level) { s->led_green_left = level; changed = 1; }
+        break;
+    case 2:
+        if (s->led_red_right != level) { s->led_red_right = level; changed = 1; }
+        break;
+    case 3:
+        if (s->led_green_right != level) { s->led_green_right = level; changed = 1; }
+        break;
+    }
+
+    if (changed) {
+        s->redraw = 1;
+        st7586_update_display(s);
+    }
+}
+
 static const VMStateDescription vmstate_st7586 = {
     .name = "st7586_lcd",
     .version_id = 1,
@@ -550,6 +647,10 @@ static const VMStateDescription vmstate_st7586 = {
         VMSTATE_INT32(disp_on, st7586_state),
         VMSTATE_INT32(all_on, st7586_state),
         VMSTATE_INT32(redraw, st7586_state),
+        VMSTATE_UINT8(led_red_left, st7586_state),
+        VMSTATE_UINT8(led_green_left, st7586_state),
+        VMSTATE_UINT8(led_red_right, st7586_state),
+        VMSTATE_UINT8(led_green_right, st7586_state),
         VMSTATE_BUFFER(ddram, st7586_state),
         VMSTATE_SSI_PERIPHERAL(ssidev, st7586_state),
         VMSTATE_END_OF_LIST()
@@ -579,6 +680,7 @@ static void st7586_realize(SSIPeripheral *d, Error **errp)
     qemu_console_resize(s->con, WIN_VIEW_W, WIN_VIEW_H);
 
     qdev_init_gpio_in(dev, st7586_cd, 1);
+    qdev_init_gpio_in_named(dev, st7586_led_in, "ev3-led", 4);
     qdev_init_gpio_out(dev, s->button_out, EV3_BTN_COUNT);
 
     s->input = qemu_input_handler_register(dev, &st7586_input_handler);
