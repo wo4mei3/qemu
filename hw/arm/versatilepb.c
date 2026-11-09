@@ -32,6 +32,7 @@
 #include "hw/sd/sd.h"
 #include "qom/object.h"
 #include "hw/usb/hcd-musb.h"
+#include "ui/input.h"
 
 #define VERSATILE_FLASH_ADDR 0x34000000
 #define VERSATILE_FLASH_SIZE (64 * 1024 * 1024)
@@ -228,10 +229,62 @@ typedef struct DA850SimplePeripherals {
     MemoryRegion ecap0_mmio;
     MemoryRegion ecap1_mmio;
     uint32_t gpio[0xd8 / 4];
+    uint32_t gpio_buttons[5];
     uint32_t pwm[0x2854 / 4];
     uint64_t timer_start_ns;
     qemu_irq lcd_cd;
 } DA850SimplePeripherals;
+
+/*
+ * EV3 Brick 6-button mapping read by d_ui.ko (Device2TimerInterrupt1 -> IN_DATA):
+ *   0: UP     -> Pin 0x7f (GP7_15) -> bank 3, bit 31 (1u << 31)
+ *   1: ENTER  -> Pin 0x01 (GP0_1)  -> bank 0, bit  1 (1u << 1)  [EP2: Pin 0x1d -> bit 29]
+ *   2: DOWN   -> Pin 0x7e (GP7_14) -> bank 3, bit 30 (1u << 30)
+ *   3: RIGHT  -> Pin 0x7c (GP7_12) -> bank 3, bit 28 (1u << 28)
+ *   4: LEFT   -> Pin 0x66 (GP6_6)  -> bank 3, bit  6 (1u << 6)
+ *   5: BACK   -> Pin 0x6a (GP6_10) -> bank 3, bit 10 (1u << 10)
+ */
+static void ev3_gpio_button_irq(void *opaque, int n, int level)
+{
+    DA850SimplePeripherals *s = opaque;
+    unsigned bank = 0;
+    uint32_t mask = 0;
+
+    switch (n) {
+    case 0: /* UP */
+        bank = 3;
+        mask = (1u << 31);
+        break;
+    case 1: /* ENTER */
+        bank = 0;
+        mask = (1u << 1) | (1u << 29);
+        break;
+    case 2: /* DOWN */
+        bank = 3;
+        mask = (1u << 30);
+        break;
+    case 3: /* RIGHT */
+        bank = 3;
+        mask = (1u << 28);
+        break;
+    case 4: /* LEFT */
+        bank = 3;
+        mask = (1u << 6);
+        break;
+    case 5: /* BACK */
+        bank = 3;
+        mask = (1u << 10);
+        break;
+    default:
+        return;
+    }
+
+    if (level) {
+        s->gpio_buttons[bank] |= mask;
+    } else {
+        s->gpio_buttons[bank] &= ~mask;
+    }
+}
 
 static uint64_t da850_gpio_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -240,7 +293,7 @@ static uint64_t da850_gpio_read(void *opaque, hwaddr offset, unsigned size)
     unsigned reg = offset % 0x28;
 
     if (bank < 5 && reg == 0x20) {
-        return s->gpio[bank * 0x28 / 4 + 0x14 / 4];
+        return s->gpio[bank * 0x28 / 4 + 0x14 / 4] | s->gpio_buttons[bank];
     }
     if (offset < sizeof(s->gpio)) {
         return s->gpio[offset / 4];
@@ -903,6 +956,12 @@ qdev_realize_and_unref(lcd, BUS(spi1_bus), &error_fatal);
 qemu_irq cs_line1 = qdev_get_gpio_in_named(lcd, SSI_GPIO_CS, 0);
 sysbus_connect_irq(SYS_BUS_DEVICE(spi1), 1, cs_line1);
 simple_peripherals->lcd_cd = qdev_get_gpio_in(lcd, 0);
+
+qemu_irq *ev3_btn_irqs = qemu_allocate_irqs(ev3_gpio_button_irq,
+                                            simple_peripherals, 6);
+for (int i = 0; i < 6; i++) {
+    qdev_connect_gpio_out(lcd, i, ev3_btn_irqs[i]);
+}
 
 
 /*
