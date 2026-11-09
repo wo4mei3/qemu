@@ -230,6 +230,7 @@ typedef struct DA850SimplePeripherals {
     uint32_t gpio[0xd8 / 4];
     uint32_t pwm[0x2854 / 4];
     uint64_t timer_start_ns;
+    qemu_irq lcd_cd;
 } DA850SimplePeripherals;
 
 static uint64_t da850_gpio_read(void *opaque, hwaddr offset, unsigned size)
@@ -261,6 +262,11 @@ static void da850_gpio_write(void *opaque, hwaddr offset,
         s->gpio[index] &= ~value;
     } else if (offset < sizeof(s->gpio)) {
         s->gpio[offset / 4] = value;
+    }
+
+    /* GPIO2_11 (pin 43: bank 1, bit 11) is ST7586 A0 (D/C) */
+    if (bank == 1 && s->lcd_cd) {
+        qemu_set_irq(s->lcd_cd, (s->gpio[1 * 0x28 / 4 + 0x14 / 4] >> 11) & 1);
     }
 }
 
@@ -775,6 +781,9 @@ sysbus_connect_irq(SYS_BUS_DEVICE(i2c0), 0, qdev_get_gpio_in(aintc, 15));
         memory_region_add_subregion(get_system_memory(), 0x01e00000, &usb_state->usb_mmio);
     }
 
+    /* USB 1.1 OHCI Host Controller (0x01e25000, IRQ 59) */
+    sysbus_create_simple("sysbus-ohci", 0x01e25000, qdev_get_gpio_in(aintc, 59));
+
 
 // タイマーの出力を AINTC の 21, 22, 24 全てに突っ込む
 //qemu_irq aintc_21 = qdev_get_gpio_in(aintc, 21);
@@ -886,6 +895,14 @@ DeviceState *spi1 = qdev_new("da850-spi");
 sysbus_realize_and_unref(SYS_BUS_DEVICE(spi1), &error_fatal);
 sysbus_mmio_map(SYS_BUS_DEVICE(spi1), 0, 0x01f0e000);
 sysbus_connect_irq(SYS_BUS_DEVICE(spi1), 0, qdev_get_gpio_in(aintc, 20)); /* IRQ_DA8XX_SPINT1 */
+
+DeviceState *lcd = qdev_new("st7586");
+SSIBus *spi1_bus = (SSIBus *)qdev_get_child_bus(spi1, "spi");
+qdev_realize_and_unref(lcd, BUS(spi1_bus), &error_fatal);
+
+qemu_irq cs_line1 = qdev_get_gpio_in_named(lcd, SSI_GPIO_CS, 0);
+sysbus_connect_irq(SYS_BUS_DEVICE(spi1), 1, cs_line1);
+simple_peripherals->lcd_cd = qdev_get_gpio_in(lcd, 0);
 
 
 /*

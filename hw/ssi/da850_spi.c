@@ -30,8 +30,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(DA850SPIState, DA850_SPI)
 #define SPILVL   0x0c
 #define SPIFLG   0x10
 #define SPIPC0   0x14
+#define SPIDAT0  0x38
 #define SPIDAT1  0x3c
 #define SPIBUF   0x40
+#define SPIEMU   0x44
 #define SPIDELAY 0x48
 #define SPIDEF   0x4c
 #define SPIFMT0  0x50
@@ -74,6 +76,7 @@ typedef struct DA850SPIState {
     uint32_t def;
     uint32_t fmt0;
 
+    uint8_t adc_pipe[2];
     int cur_cs;
 } DA850SPIState;
 
@@ -127,8 +130,11 @@ static uint64_t da850_spi_read(void *opaque, hwaddr addr, unsigned size)
     case SPILVL:  return s->lvl;
     case SPIFLG:  return s->flg;
     case SPIPC0:  return s->pc0;
+    case SPIDAT0: return s->dat1 & 0xffff;
     case SPIDAT1: return s->dat1;
-    case SPIBUF:  return s->buf | SPIBUF_RXEMPTY_MASK; /* read clears */
+    case SPIBUF:
+    case SPIEMU:
+        return s->buf & ~(SPIBUF_RXEMPTY_MASK | SPIBUF_TXFULL_MASK);
     case SPIDELAY: return s->delay;
     case SPIDEF:  return s->def;
     case SPIFMT0: return s->fmt0;
@@ -167,6 +173,20 @@ static void da850_spi_write(void *opaque, hwaddr addr,
     case SPIPC0:
         s->pc0 = val;
         break;
+    case SPIDAT0:
+    {
+        uint8_t out_ch = s->adc_pipe[1];
+        s->adc_pipe[1] = s->adc_pipe[0];
+        if ((val & 0xf000) == 0x1000) {
+            s->adc_pipe[0] = (val >> 7) & 0x0f;
+        }
+        s->dat1 = (s->dat1 & 0xffff0000u) | (val & 0xffffu);
+        /* ADS7957 channel 4 is EV3 battery voltage (Cell123456).
+         * 0x0c80 (3200) corresponds to ~7.8V so lms2012 does not
+         * trigger a critical low-battery poweroff. */
+        s->buf = (out_ch == 4) ? 0x0c80 : 0;
+        break;
+    }
     case SPIDAT1:
         s->dat1 = val;
         /*fprintf(stderr, "SPI: SPIDAT1 WRITE tx=0x%02x (gcr1=0x%08x)\n",
@@ -219,7 +239,7 @@ static void da850_spi_realize(DeviceState *dev, Error **errp)
 {
     DA850SPIState *s = DA850_SPI(dev);
 
-    s->buf = SPIBUF_RXEMPTY_MASK | SPIBUF_TXFULL_MASK;
+    s->buf = 0;
     s->cur_cs = -1;
     for (int i = 0; i < SPI_MAX_CS; i++) {
         qemu_set_irq(s->cs_lines[i], 1); /* idle = deselected */

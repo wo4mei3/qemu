@@ -47,6 +47,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(DA850EDMAState, DA850_EDMA)
 
 #define SPI0_RX_CHAN      14
 #define SPI0_TX_CHAN      15
+#define SPI1_RX_CHAN      18
+#define SPI1_TX_CHAN      19
 
 /*
  * --------------------------------------------------------------------------
@@ -611,13 +613,15 @@ static bool da850_edma_step(DA850EDMAState *s,
  * This gives us a simple full-duplex SPI model.
  */
 
-static void da850_edma_run_spi_pair(DA850EDMAState *s)
+static void da850_edma_run_spi_pair(DA850EDMAState *s,
+                                    unsigned rx_chan,
+                                    unsigned tx_chan)
 {
     DA850EDMAChanState *rx;
     DA850EDMAChanState *tx;
 
-    rx = &s->chan[SPI0_RX_CHAN];
-    tx = &s->chan[SPI0_TX_CHAN];
+    rx = &s->chan[rx_chan];
+    tx = &s->chan[tx_chan];
 
     /*fprintf(stderr,
             "EDMA: SPI pair "
@@ -650,11 +654,11 @@ static void da850_edma_run_spi_pair(DA850EDMAState *s)
      */
     while (tx->armed && rx->armed) {
 
-        if (!da850_edma_step(s, SPI0_TX_CHAN)) {
+        if (!da850_edma_step(s, tx_chan)) {
             break;
         }
 
-        if (!da850_edma_step(s, SPI0_RX_CHAN)) {
+        if (!da850_edma_step(s, rx_chan)) {
             break;
         }
     }
@@ -665,13 +669,13 @@ static void da850_edma_run_spi_pair(DA850EDMAState *s)
      * Normally EV3 SPI TX/RX have equal lengths.
      */
     while (tx->armed) {
-        if (!da850_edma_step(s, SPI0_TX_CHAN)) {
+        if (!da850_edma_step(s, tx_chan)) {
             break;
         }
     }
 
     while (rx->armed) {
-        if (!da850_edma_step(s, SPI0_RX_CHAN)) {
+        if (!da850_edma_step(s, rx_chan)) {
             break;
         }
     }
@@ -713,7 +717,14 @@ static void da850_edma_maybe_kick(DA850EDMAState *s,
     if (chan == SPI0_RX_CHAN ||
         chan == SPI0_TX_CHAN) {
 
-        da850_edma_run_spi_pair(s);
+        da850_edma_run_spi_pair(s, SPI0_RX_CHAN, SPI0_TX_CHAN);
+        return;
+    }
+
+    if (chan == SPI1_RX_CHAN ||
+        chan == SPI1_TX_CHAN) {
+
+        da850_edma_run_spi_pair(s, SPI1_RX_CHAN, SPI1_TX_CHAN);
         return;
     }
 

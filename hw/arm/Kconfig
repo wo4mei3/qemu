@@ -275,6 +275,7 @@ config VERSATILE
     select PL080  # DMA controller
     select PL190  # Vector PIC
     select REALVIEW
+    select ST7586
     select USB_OHCI
 
 config VEXPRESS
