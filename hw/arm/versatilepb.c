@@ -33,6 +33,8 @@
 #include "qom/object.h"
 #include "hw/usb/hcd-musb.h"
 #include "ui/input.h"
+#include "audio/audio.h"
+#include <math.h>
 
 #define VERSATILE_FLASH_ADDR 0x34000000
 #define VERSATILE_FLASH_SIZE (64 * 1024 * 1024)
@@ -222,18 +224,87 @@ static const MemoryRegionOps da850_syscfg_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+#define EV3_SOUND_SAMPLE_RATE 44100
+#define EV3_SOUND_BUF_LEN     2048
+
+typedef struct EV3SoundState {
+    QEMUSoundCard card;
+    SWVoiceOut *voice;
+    int16_t sample_buf[EV3_SOUND_BUF_LEN];
+    uint32_t freq_hz;
+    uint32_t volume;
+    uint32_t phase;
+    bool enabled;
+} EV3SoundState;
+
 typedef struct DA850SimplePeripherals {
     MemoryRegion gpio_mmio;
     MemoryRegion timer_mmio;
-    MemoryRegion ehrpwm_mmio;
+    MemoryRegion ehrpwm0_mmio;
+    MemoryRegion ehrpwm1_mmio;
     MemoryRegion ecap0_mmio;
     MemoryRegion ecap1_mmio;
-    uint32_t gpio[0xd8 / 4];
-    uint32_t gpio_buttons[5];
-    uint32_t pwm[0x2854 / 4];
+    uint32_t gpio[0x1000 / 4];
+    uint32_t gpio_buttons[10];
+    uint8_t pwm0[0x1000];
+    uint8_t pwm1[0x2854];
     uint64_t timer_start_ns;
     qemu_irq lcd_cd;
+    EV3SoundState sound;
 } DA850SimplePeripherals;
+
+static void ev3_sound_callback(void *opaque, int free)
+{
+    EV3SoundState *s = opaque;
+    if (!s->voice) {
+        return;
+    }
+
+    while (free > 0) {
+        int to_write = MIN(free / 2, EV3_SOUND_BUF_LEN);
+        if (to_write <= 0) {
+            break;
+        }
+
+        if (s->enabled && s->freq_hz >= 50 && s->freq_hz <= 15000 && s->volume > 0) {
+            /* Generate sine wave tone scaled by volume */
+            uint32_t phase_inc = (uint32_t)(((uint64_t)s->freq_hz << 32) / EV3_SOUND_SAMPLE_RATE);
+            int32_t amp = (int32_t)((s->volume * 28000) / 100);
+            for (int i = 0; i < to_write; i++) {
+                /* Fast sine approximation */
+                float angle = (float)(s->phase >> 16) * (2.0f * (float)M_PI / 65536.0f);
+                s->sample_buf[i] = (int16_t)(sinf(angle) * amp);
+                s->phase += phase_inc;
+            }
+        } else {
+            memset(s->sample_buf, 0, to_write * sizeof(int16_t));
+            s->phase = 0;
+        }
+
+        int written = AUD_write(s->voice, s->sample_buf, to_write * 2);
+        if (written <= 0) {
+            break;
+        }
+        free -= written;
+    }
+}
+
+static void ev3_sound_init(EV3SoundState *s)
+{
+    struct audsettings as = {
+        .freq = EV3_SOUND_SAMPLE_RATE,
+        .nchannels = 1,
+        .fmt = AUDIO_FORMAT_S16,
+        .endianness = 0,
+    };
+
+    AUD_register_card("ev3-sound", &s->card);
+    s->voice = AUD_open_out(&s->card, NULL, "ev3-speaker", s,
+                            ev3_sound_callback, &as);
+    if (s->voice) {
+        AUD_set_active_out(s->voice, 1);
+    }
+}
 
 /*
  * EV3 Brick 6-button mapping read by d_ui.ko (Device2TimerInterrupt1 -> IN_DATA):
@@ -292,7 +363,7 @@ static uint64_t da850_gpio_read(void *opaque, hwaddr offset, unsigned size)
     unsigned bank = offset / 0x28;
     unsigned reg = offset % 0x28;
 
-    if (bank < 5 && reg == 0x20) {
+    if (bank < 10 && reg == 0x20) {
         return s->gpio[bank * 0x28 / 4 + 0x14 / 4] | s->gpio_buttons[bank];
     }
     if (offset < sizeof(s->gpio)) {
@@ -309,9 +380,9 @@ static void da850_gpio_write(void *opaque, hwaddr offset,
     unsigned reg = offset % 0x28;
     unsigned index = bank * 0x28 / 4 + 0x14 / 4;
 
-    if (bank < 5 && reg == 0x18) {
+    if (bank < 10 && reg == 0x18) {
         s->gpio[index] |= value;
-    } else if (bank < 5 && reg == 0x1c) {
+    } else if (bank < 10 && reg == 0x1c) {
         s->gpio[index] &= ~value;
     } else if (offset < sizeof(s->gpio)) {
         s->gpio[offset / 4] = value;
@@ -320,6 +391,15 @@ static void da850_gpio_write(void *opaque, hwaddr offset,
     /* GPIO2_11 (pin 43: bank 1, bit 11) is ST7586 A0 (D/C) */
     if (bank == 1 && s->lcd_cd) {
         qemu_set_irq(s->lcd_cd, (s->gpio[1 * 0x28 / 4 + 0x14 / 4] >> 11) & 1);
+    }
+
+    /* Pin 111 (bank 3, bit 15) and Pin 161 (bank 5, bit 1): EV3 Audio Enable */
+    if (bank == 3 || bank == 5) {
+        bool amp111 = (s->gpio[3 * 0x28 / 4 + 0x14 / 4] >> 15) & 1;
+        bool amp161 = (s->gpio[5 * 0x28 / 4 + 0x14 / 4] >> 1) & 1;
+        if (!amp111 && !amp161) {
+            s->sound.enabled = false;
+        }
     }
 }
 
@@ -353,29 +433,82 @@ static const MemoryRegionOps da850_timer_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-static uint64_t da850_pwm_read(void *opaque, hwaddr offset, unsigned size)
+static uint64_t da850_pwm0_read(void *opaque, hwaddr offset, unsigned size)
 {
     DA850SimplePeripherals *s = opaque;
 
-    if (offset < sizeof(s->pwm)) {
-        return s->pwm[offset / 4];
+    if (offset + size <= sizeof(s->pwm0)) {
+        uint64_t val = 0;
+        memcpy(&val, &s->pwm0[offset], size);
+        return val;
     }
     return 0;
 }
 
-static void da850_pwm_write(void *opaque, hwaddr offset,
-                            uint64_t value, unsigned size)
+static void da850_pwm0_write(void *opaque, hwaddr offset,
+                             uint64_t value, unsigned size)
 {
     DA850SimplePeripherals *s = opaque;
 
-    if (offset < sizeof(s->pwm)) {
-        s->pwm[offset / 4] = value;
+    if (offset + size <= sizeof(s->pwm0)) {
+        memcpy(&s->pwm0[offset], &value, size);
+    }
+
+    /*
+     * eHRPWM0 Sound Controller:
+     * Base: 0x01f00000
+     * Offset 0x0a: TBPRD (Period). Tone frequency = 1,031,250 / (TBPRD + 1)
+     * Offset 0x14: CMPA  (Duty). Volume = (CMPA * 200) / TBPRD (0..100%)
+     * Offset 0x00: TBCTL (Control). CTRMODE == 3 (0x03) stops counter
+     */
+    uint16_t tbprd = *(uint16_t *)&s->pwm0[0x0a];
+    uint16_t cmpa  = *(uint16_t *)&s->pwm0[0x14];
+    uint16_t tbctl = *(uint16_t *)&s->pwm0[0x00];
+
+    if (tbprd >= 10 && cmpa > 0 && (tbctl & 0x0003) != 0x0003) {
+        uint32_t freq = 1031250u / (tbprd + 1);
+        uint32_t vol  = (cmpa * 200u) / tbprd;
+        if (vol > 100) vol = 100;
+
+        s->sound.freq_hz = freq;
+        s->sound.volume = vol;
+        s->sound.enabled = true;
+    } else if (tbprd == 0 || cmpa == 0 || (tbctl & 0x0003) == 0x0003) {
+        s->sound.enabled = false;
     }
 }
 
-static const MemoryRegionOps da850_pwm_ops = {
-    .read = da850_pwm_read,
-    .write = da850_pwm_write,
+static const MemoryRegionOps da850_pwm0_ops = {
+    .read = da850_pwm0_read,
+    .write = da850_pwm0_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static uint64_t da850_pwm1_read(void *opaque, hwaddr offset, unsigned size)
+{
+    DA850SimplePeripherals *s = opaque;
+
+    if (offset + size <= sizeof(s->pwm1)) {
+        uint64_t val = 0;
+        memcpy(&val, &s->pwm1[offset], size);
+        return val;
+    }
+    return 0;
+}
+
+static void da850_pwm1_write(void *opaque, hwaddr offset,
+                             uint64_t value, unsigned size)
+{
+    DA850SimplePeripherals *s = opaque;
+
+    if (offset + size <= sizeof(s->pwm1)) {
+        memcpy(&s->pwm1[offset], &value, size);
+    }
+}
+
+static const MemoryRegionOps da850_pwm1_ops = {
+    .read = da850_pwm1_read,
+    .write = da850_pwm1_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
@@ -724,7 +857,7 @@ sysbus_connect_irq(aintc_bus, 0, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
     simple_peripherals->timer_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     memory_region_init_io(&simple_peripherals->gpio_mmio, OBJECT(machine),
                           &da850_gpio_ops, simple_peripherals,
-                          "da850-gpio", 0xd8);
+                          "da850-gpio", 0x1000);
     memory_region_add_subregion(get_system_memory(), 0x01e26000,
                                 &simple_peripherals->gpio_mmio);
     memory_region_init_io(&simple_peripherals->timer_mmio, OBJECT(machine),
@@ -732,21 +865,28 @@ sysbus_connect_irq(aintc_bus, 0, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
                           "da850-timer64p3", 0x80);
     memory_region_add_subregion(get_system_memory(), 0x01f0d000,
                                 &simple_peripherals->timer_mmio);
-    memory_region_init_io(&simple_peripherals->ehrpwm_mmio, OBJECT(machine),
-                          &da850_pwm_ops, simple_peripherals,
-                          "da850-ehrpwm", 0x2854);
+    memory_region_init_io(&simple_peripherals->ehrpwm0_mmio, OBJECT(machine),
+                          &da850_pwm0_ops, simple_peripherals,
+                          "da850-ehrpwm0", 0x2000);
+    memory_region_add_subregion(get_system_memory(), 0x01f00000,
+                                &simple_peripherals->ehrpwm0_mmio);
+    memory_region_init_io(&simple_peripherals->ehrpwm1_mmio, OBJECT(machine),
+                          &da850_pwm1_ops, simple_peripherals,
+                          "da850-ehrpwm1", 0x2854);
     memory_region_add_subregion(get_system_memory(), 0x01f02000,
-                                &simple_peripherals->ehrpwm_mmio);
+                                &simple_peripherals->ehrpwm1_mmio);
     memory_region_init_io(&simple_peripherals->ecap0_mmio, OBJECT(machine),
-                          &da850_pwm_ops, simple_peripherals,
+                          &da850_pwm1_ops, simple_peripherals,
                           "da850-ecap0", 0x60);
     memory_region_add_subregion(get_system_memory(), 0x01f06000,
                                 &simple_peripherals->ecap0_mmio);
     memory_region_init_io(&simple_peripherals->ecap1_mmio, OBJECT(machine),
-                          &da850_pwm_ops, simple_peripherals,
+                          &da850_pwm1_ops, simple_peripherals,
                           "da850-ecap1", 0x60);
     memory_region_add_subregion(get_system_memory(), 0x01f07000,
                                 &simple_peripherals->ecap1_mmio);
+
+    ev3_sound_init(&simple_peripherals->sound);
 /*
         MemoryRegion *psc0 = g_new(MemoryRegion, 1);
     memory_region_init_io(psc0, NULL, &da850_psc_ops, NULL, "da850.psc0", 0x1000);
