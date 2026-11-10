@@ -408,14 +408,13 @@ static bool ev3_usb_send_packet(const uint8_t *pkt, size_t len,
     *state_80c = 0;
 
     int wait_cnt = 0;
-    while (*len_out > 0 && wait_cnt < 200) {
+    while (*len_out > 0 && wait_cnt < 25) {
         *state_80c = 0;
-        g_usleep(2000);
+        g_usleep(1000);
         wait_cnt++;
     }
     if (*len_out > 0) {
-        fprintf(stderr, "[EV3 USB BRIDGE] Out buffer busy (len_out=%u) timed out!\n", *len_out);
-        return false;
+        *len_out = 0;
     }
 
     *state_80c = 0;
@@ -426,48 +425,70 @@ static bool ev3_usb_send_packet(const uint8_t *pkt, size_t len,
     if (rep && rep_len) {
         int waited = 0;
         int max_wait = timeout_ms * 1000;
-        while (*len_in == 0 && waited < max_wait) {
-            *state_80c = 0;
-            g_usleep(2000);
-            waited += 2000;
-        }
-        if (*len_in == 0) {
-            fprintf(stderr, "[EV3 USB BRIDGE] Reply timed out after %d ms (cmd=0x%02x, len_out=%u)!\n",
-                    timeout_ms, len > 5 ? pkt[5] : 0, *len_out);
-            return false;
-        }
-        uint32_t chunk_len = *len_in;
-        if (chunk_len > 1024) chunk_len = 1024;
-        memcpy(rep, (void *)buf_in, chunk_len);
-        *len_in = 0;
-        *state_80c = 0;
+        size_t total_received = 0;
 
-        size_t total_received = chunk_len;
-        if (total_received >= 2) {
-            uint16_t expected_total = (rep[0] | (rep[1] << 8)) + 2;
-            while (total_received < expected_total && total_received < 2048) {
-                waited = 0;
-                while (*len_in == 0 && waited < 500000) { /* 500ms between chunks */
-                    *state_80c = 0;
-                    g_usleep(2000);
-                    waited += 2000;
-                }
-                if (*len_in == 0) break;
-                uint32_t next_chunk = *len_in;
-                if (total_received + next_chunk > 2048) {
-                    next_chunk = 2048 - total_received;
-                }
-                memcpy(rep + total_received, (void *)buf_in, next_chunk);
-                total_received += next_chunk;
-                *len_in = 0;
+        while (waited < max_wait) {
+            while (*len_in == 0 && waited < max_wait) {
                 *state_80c = 0;
+                g_usleep(1000);
+                waited += 1000;
             }
-            if (total_received > expected_total) {
-                total_received = expected_total;
+            if (*len_in == 0) break;
+
+            uint32_t chunk_len = *len_in;
+            if (chunk_len > 1024) chunk_len = 1024;
+            memcpy(rep, (void *)buf_in, chunk_len);
+            *len_in = 0;
+            *state_80c = 0;
+
+            /* Ignore empty dummy buffer */
+            if (chunk_len < 2 || (rep[0] == 0 && rep[1] == 0)) {
+                continue;
             }
+
+            /* Filter out unsolicited daisy chain push packet (58 bytes, cmd_type 0x08) */
+            if (chunk_len >= 5 && (rep[4] == 0x08 || (chunk_len == 58 && rep[0] == 0x3a && rep[1] == 0x00))) {
+                continue;
+            }
+
+            total_received = chunk_len;
+            if (total_received >= 2) {
+                uint16_t expected_total = (rep[0] | (rep[1] << 8)) + 2;
+                while (total_received < expected_total && total_received < 2048) {
+                    int chunk_waited = 0;
+                    while (*len_in == 0 && chunk_waited < 300000) {
+                        *state_80c = 0;
+                        g_usleep(1000);
+                        chunk_waited += 1000;
+                    }
+                    if (*len_in == 0) break;
+                    uint32_t next_chunk = *len_in;
+                    volatile uint8_t *in_ptr = (volatile uint8_t *)buf_in;
+                    if (next_chunk >= 5 && (in_ptr[4] == 0x08 ||
+                        (next_chunk == 58 && in_ptr[0] == 0x3a && in_ptr[1] == 0x00))) {
+                        *len_in = 0;
+                        *state_80c = 0;
+                        continue;
+                    }
+                    if (total_received + next_chunk > 2048) {
+                        next_chunk = 2048 - total_received;
+                    }
+                    memcpy(rep + total_received, (void *)buf_in, next_chunk);
+                    total_received += next_chunk;
+                    *len_in = 0;
+                    *state_80c = 0;
+                }
+                if (total_received > expected_total) {
+                    total_received = expected_total;
+                }
+            }
+            *rep_len = total_received;
+            return true;
         }
-        *rep_len = total_received;
-        return true;
+
+        fprintf(stderr, "[EV3 USB BRIDGE] Reply timed out after %d ms (cmd=0x%02x, len_out=%u)!\n",
+                timeout_ms, len > 5 ? pkt[5] : 0, *len_out);
+        return false;
     }
     return true;
 }
@@ -783,22 +804,18 @@ static void ev3_sync_to_guest(char cmd, const char *path, const void *data, size
 
     unsigned short plen = path ? strlen(path) : 0;
     if (cmd == 'D' || cmd == 'R') {
-        send(sock, &cmd, 1, 0);
-        send(sock, &plen, 2, 0);
-        if (plen > 0) send(sock, path, plen, 0);
-        unsigned char ack = 0;
-        recv(sock, &ack, 1, 0);
+        send(sock, &cmd, 1, MSG_NOSIGNAL);
+        send(sock, &plen, 2, MSG_NOSIGNAL);
+        if (plen > 0) send(sock, path, plen, MSG_NOSIGNAL);
     } else if (cmd == 'F') {
         unsigned int flen = data_len;
-        send(sock, &cmd, 1, 0);
-        send(sock, &plen, 2, 0);
-        send(sock, &flen, 4, 0);
-        if (plen > 0) send(sock, path, plen, 0);
+        send(sock, &cmd, 1, MSG_NOSIGNAL);
+        send(sock, &plen, 2, MSG_NOSIGNAL);
+        send(sock, &flen, 4, MSG_NOSIGNAL);
+        if (plen > 0) send(sock, path, plen, MSG_NOSIGNAL);
         if (flen > 0 && data) {
-            send(sock, data, flen, 0);
+            send(sock, data, flen, MSG_NOSIGNAL);
         }
-        unsigned char ack = 0;
-        recv(sock, &ack, 1, 0);
     }
     close(sock);
     fprintf(stderr, "[EV3 COM] ev3_sync_to_guest: cmd='%c' path='%s' (%zu bytes) synced to guest!\n", cmd, path ? path : "", data_len);
@@ -844,7 +861,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
             }
             http_buf[rn] = '\0';
             fprintf(stderr, "[EV3 COM] Received VMTP unlock request (%d bytes): %s\n", rn, http_buf);
-            send(client_fd, "Accept:EV340\r\n\r\n", 16, 0);
+            send(client_fd, "Accept:EV340\r\n\r\n", 16, MSG_NOSIGNAL);
             fprintf(stderr, "[EV3 COM] Sent Accept:EV340 response\n");
             continue;
         }
@@ -865,7 +882,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
         buf[2 + pkt_len] = '\0';
 
         fprintf(stderr, "[EV3 COM] Pkt (%d bytes): ", 2 + pkt_len);
-        for (int i = 0; i < 2 + pkt_len && i < 32; i++) {
+        for (int i = 0; i < 2 + pkt_len; i++) {
             fprintf(stderr, "%02x ", buf[i]);
         }
         fprintf(stderr, "\n");
@@ -873,15 +890,109 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
         unsigned short counter = buf[2] | (buf[3] << 8);
         unsigned char cmd_type = buf[4];
 
-        bool has_reply = (cmd_type == 0x00 || cmd_type == 0x01);
-        uint8_t rep_buf[2048];
-        size_t rep_sz = 0;
-        if (ev3_usb_send_packet(buf, 2 + pkt_len, has_reply ? rep_buf : NULL, has_reply ? &rep_sz : NULL, 2000)) {
-            if (has_reply && rep_sz > 0) {
-                send(client_fd, rep_buf, rep_sz, 0);
-                fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes)\n", rep_sz);
+        /* CLOSE_FILEHANDLE (0x98):
+         * Guest lms2012 automatically closes the file and frees the handle at EOF
+         * during CONTINUE_DOWNLOAD (0x93). Forwarding 0x98 to guest causes it to drop
+         * the packet and ev3_usb_send_packet to time out after 2000ms.
+         * Reply SUCCESS directly to PC software immediately.
+         */
+        if (cmd_type == 0x01 && buf[5] == 0x98) {
+            unsigned char h = buf[6];
+            fprintf(stderr, "[EV3 COM] Intercepted CLOSE_FILEHANDLE (handle=%d), replied SUCCESS (0ms)\n", h);
+            unsigned char rep[8] = {
+                0x06, 0x00,
+                (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                0x03, 0x98, 0x00, h
+            };
+            send(client_fd, rep, 8, MSG_NOSIGNAL);
+
+            /* Play download chime on brick */
+            if (sp) {
+                sp->sound.freq_hz = 1200;
+                sp->sound.volume = 60;
+                sp->sound.enabled = true;
+                ToneStopArg *stop_arg = g_new0(ToneStopArg, 1);
+                stop_arg->sp = sp;
+                stop_arg->dur_ms = 150;
+                QemuThread th;
+                qemu_thread_create(&th, "ev3-tone-stop", ev3_tone_stop_worker, stop_arg, QEMU_THREAD_DETACHED);
             }
             continue;
+        }
+
+        /*
+         * Intercept LIST_FILES (0x99):
+         * Guest lms2012 leaves directory handles open, causing subsequent LIST_FILES
+         * (e.g. BrkProg_SAVE) to hang. Reply natively in 0ms.
+         */
+        if (cmd_type == 0x01 && buf[5] == 0x99) {
+            char req_path[256] = { 0 };
+            if (pkt_len > 6) {
+                snprintf(req_path, sizeof(req_path), "%.128s", (char *)&buf[8]);
+            }
+            char target_dir[512];
+            ev3_resolve_path(req_path, target_dir, sizeof(target_dir));
+
+            char list_str[2048] = { 0 };
+            int list_len = 0;
+
+            DIR *dir = opendir(target_dir);
+            if (dir) {
+                struct dirent *ent;
+                while ((ent = readdir(dir)) != NULL) {
+                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                    char full_entry[1024];
+                    snprintf(full_entry, sizeof(full_entry), "%s/%s", target_dir, ent->d_name);
+                    struct stat st;
+                    if (stat(full_entry, &st) == 0) {
+                        if (S_ISDIR(st.st_mode)) {
+                            list_len += snprintf(list_str + list_len, sizeof(list_str) - list_len, "%s/\n", ent->d_name);
+                        } else {
+                            list_len += snprintf(list_str + list_len, sizeof(list_str) - list_len,
+                                                 "00000000000000000000000000000000 %08x %s\n",
+                                                 (unsigned int)st.st_size, ent->d_name);
+                        }
+                    }
+                }
+                closedir(dir);
+            }
+
+            if (list_len == 0 && strcmp(target_dir, "/tmp/ev3_prjs") == 0) {
+                list_len = snprintf(list_str, sizeof(list_str), "BrkProg_SAVE/\n");
+            }
+
+            int rep_payload_len = 10 + list_len;
+            unsigned char rep[2048];
+            rep[0] = rep_payload_len & 0xFF;
+            rep[1] = (rep_payload_len >> 8) & 0xFF;
+            rep[2] = (unsigned char)(counter & 0xFF);
+            rep[3] = (unsigned char)((counter >> 8) & 0xFF);
+            rep[4] = 0x03; /* SYSTEM_REPLY */
+            rep[5] = 0x99; /* LIST_FILES */
+            rep[6] = 0x00; /* SUCCESS */
+            rep[7] = (unsigned char)(list_len & 0xFF);
+            rep[8] = (unsigned char)((list_len >> 8) & 0xFF);
+            rep[9] = (unsigned char)((list_len >> 16) & 0xFF);
+            rep[10] = (unsigned char)((list_len >> 24) & 0xFF);
+            rep[11] = 0x00; /* Handle: 0 = list completed in one chunk */
+            memcpy(&rep[12], list_str, list_len);
+            send(client_fd, rep, 2 + rep_payload_len, MSG_NOSIGNAL);
+            fprintf(stderr, "[EV3 COM] LIST_FILES (%s): returned %d bytes (list_len=%d):\n%s", target_dir, 2 + rep_payload_len, list_len, list_str);
+            continue;
+        }
+
+        /* Direct commands: forward short queries (<= 32 bytes) to guest LMS2012 with fast 40ms timeout */
+        if ((cmd_type == 0x00 || cmd_type == 0x80) && pkt_len <= 32) {
+            bool has_reply = (cmd_type == 0x00);
+            uint8_t rep_buf[2048];
+            size_t rep_sz = 0;
+            if (ev3_usb_send_packet(buf, 2 + pkt_len, has_reply ? rep_buf : NULL, has_reply ? &rep_sz : NULL, 40)) {
+                if (has_reply && rep_sz > 0) {
+                    send(client_fd, rep_buf, rep_sz, MSG_NOSIGNAL);
+                    fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes)\n", rep_sz);
+                }
+                continue;
+            }
         }
 
         if (cmd_type == 0x01 || cmd_type == 0x81) {
@@ -913,13 +1024,17 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     file_handles[h] = fd;
                     snprintf(file_ev3_paths[h], sizeof(file_ev3_paths[h]), "%.1000s", filename);
                     snprintf(file_safe_paths[h], sizeof(file_safe_paths[h]), "%.1000s", safe_path);
+
+                    /* Also forward BEGIN_DOWNLOAD to guest LMS2012 via d_usbdev so guest writes it to /mnt/ramdisk/prjs/ */
+                    ev3_usb_send_packet(buf, 2 + pkt_len, NULL, NULL, 0);
+
                     if (cmd_type == 0x01) {
                         unsigned char rep[8] = {
                             0x06, 0x00,
                             (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
                             0x03, 0x92, 0x00, (unsigned char)h
                         };
-                        send(client_fd, rep, 8, 0);
+                        send(client_fd, rep, 8, MSG_NOSIGNAL);
                     }
                 } else {
                     if (cmd_type == 0x01) {
@@ -928,7 +1043,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                             (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
                             0x03, 0x92, 0x05, 0x00
                         };
-                        send(client_fd, rep, 8, 0);
+                        send(client_fd, rep, 8, MSG_NOSIGNAL);
                     }
                 }
             } else if (sys_cmd == 0x93) {
@@ -940,21 +1055,28 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                         /* write error */
                     }
                 }
+
+                /* Also forward CONTINUE_DOWNLOAD to guest LMS2012 via d_usbdev */
+                ev3_usb_send_packet(buf, 2 + pkt_len, NULL, NULL, 0);
+
                 if (cmd_type == 0x01) {
                     unsigned char rep[8] = {
                         0x06, 0x00,
                         (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
                         0x03, 0x93, 0x00, h
                     };
-                    send(client_fd, rep, 8, 0);
+                    send(client_fd, rep, 8, MSG_NOSIGNAL);
                 }
-            } else if (sys_cmd == 0x98 || sys_cmd == 0x94) {
-                /* CLOSE_FILEHANDLE: official EV3 command is 0x98 (0x94 also supported) */
+            } else if (sys_cmd == 0x98) {
+                /* CLOSE_FILEHANDLE: official EV3 command is 0x98 */
                 unsigned char h = buf[6];
-                fprintf(stderr, "[EV3 COM] CLOSE_FILEHANDLE: handle %d (sys_cmd=0x%02x, download finished!)\n", h, sys_cmd);
+                fprintf(stderr, "[EV3 COM] CLOSE_FILEHANDLE: handle %d (download finished!)\n", h);
                 if (h < 8 && file_handles[h] > 0) {
                     close(file_handles[h]);
                     file_handles[h] = 0;
+
+                    /* Also forward CLOSE_FILEHANDLE to guest LMS2012 via d_usbdev */
+                    ev3_usb_send_packet(buf, 2 + pkt_len, NULL, NULL, 0);
 
                     /* Send immediate success reply to PC before syncing */
                     if (cmd_type == 0x01) {
@@ -963,7 +1085,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                             (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
                             0x03, sys_cmd, 0x00, h
                         };
-                        send(client_fd, rep, 8, 0);
+                        send(client_fd, rep, 8, MSG_NOSIGNAL);
                     }
 
                     /* Sync to EV3 guest at /mnt/ramdisk/prjs/<Project>/<Program> */
@@ -997,13 +1119,132 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     }
                 } else {
                     if (cmd_type == 0x01) {
-                        unsigned char rep[7] = {
-                            0x05, 0x00,
+                        unsigned char rep[8] = {
+                            0x06, 0x00,
                             (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
-                            0x03, sys_cmd, 0x00
+                            0x03, sys_cmd, 0x00, h
                         };
-                        send(client_fd, rep, 7, 0);
+                        send(client_fd, rep, 8, MSG_NOSIGNAL);
                     }
+                }
+            } else if (sys_cmd == 0x94) {
+                /* BEGIN_UPLOAD: buf[6..7] = bytes_to_read, buf[8...] = filename */
+                if (pkt_len <= 5) {
+                    /* ev3_tool mock close handle */
+                    unsigned char h = buf[6];
+                    if (h < 8 && file_handles[h] > 0) {
+                        close(file_handles[h]);
+                        file_handles[h] = 0;
+                    }
+                    if (cmd_type == 0x01) {
+                        unsigned char rep[8] = {
+                            0x06, 0x00,
+                            (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                            0x03, 0x94, 0x00, h
+                        };
+                        send(client_fd, rep, 8, MSG_NOSIGNAL);
+                    }
+                } else {
+                    uint16_t bytes_to_read = buf[6] | (buf[7] << 8);
+                    const char *filename = (const char *)&buf[8];
+                    char safe_path[512];
+                    ev3_resolve_path(filename, safe_path, sizeof(safe_path));
+                    fprintf(stderr, "[EV3 COM] BEGIN_UPLOAD: %s (safe_path=%s, bytes_to_read=%u)\n",
+                            filename, safe_path, bytes_to_read);
+
+                    FILE *fp = fopen(safe_path, "rb");
+                    if (fp) {
+                        fseek(fp, 0, SEEK_END);
+                        uint32_t fsize = (uint32_t)ftell(fp);
+                        fseek(fp, 0, SEEK_SET);
+
+                        uint16_t chunk = bytes_to_read > 1024 ? 1024 : bytes_to_read;
+                        if (chunk > fsize) chunk = (uint16_t)fsize;
+
+                        uint8_t payload[1024];
+                        size_t rd = fread(payload, 1, chunk, fp);
+
+                        uint8_t upload_handle = 0;
+                        if (rd < fsize) {
+                            for (int i = 1; i < 8; i++) {
+                                if (file_handles[i] <= 0) {
+                                    file_handles[i] = fileno(fp);
+                                    upload_handle = i;
+                                    break;
+                                }
+                            }
+                            if (upload_handle == 0) fclose(fp);
+                        } else {
+                            fclose(fp);
+                        }
+
+                        int rep_payload_len = 10 + rd;
+                        uint8_t rep[2048];
+                        rep[0] = rep_payload_len & 0xFF;
+                        rep[1] = (rep_payload_len >> 8) & 0xFF;
+                        rep[2] = (uint8_t)(counter & 0xFF);
+                        rep[3] = (uint8_t)((counter >> 8) & 0xFF);
+                        rep[4] = 0x03;
+                        rep[5] = 0x94;
+                        rep[6] = 0x00; /* SUCCESS */
+                        rep[7] = fsize & 0xFF;
+                        rep[8] = (fsize >> 8) & 0xFF;
+                        rep[9] = (fsize >> 16) & 0xFF;
+                        rep[10] = (fsize >> 24) & 0xFF;
+                        rep[11] = upload_handle;
+                        memcpy(&rep[12], payload, rd);
+
+                        send(client_fd, rep, 2 + rep_payload_len, MSG_NOSIGNAL);
+                        fprintf(stderr, "[EV3 COM] BEGIN_UPLOAD: Sent %zu/%u bytes (handle=%d)\n",
+                                rd, fsize, upload_handle);
+                    } else {
+                        uint8_t rep[7] = {
+                            0x05, 0x00,
+                            (uint8_t)(counter & 0xFF), (uint8_t)((counter >> 8) & 0xFF),
+                            0x05, 0x94, 0x05 /* HANDLE_NOT_READY / FILE_NOT_FOUND */
+                        };
+                        send(client_fd, rep, 7, MSG_NOSIGNAL);
+                        fprintf(stderr, "[EV3 COM] BEGIN_UPLOAD: file not found: %s\n", safe_path);
+                    }
+                }
+            } else if (sys_cmd == 0x95) {
+                /* CONTINUE_UPLOAD */
+                uint8_t h = buf[6];
+                uint16_t bytes_to_read = buf[7] | (buf[8] << 8);
+                if (h < 8 && file_handles[h] > 0) {
+                    uint16_t chunk = bytes_to_read > 1024 ? 1024 : bytes_to_read;
+                    uint8_t payload[1024];
+                    ssize_t rd = read(file_handles[h], payload, chunk);
+                    if (rd < 0) rd = 0;
+
+                    uint8_t next_h = h;
+                    if ((size_t)rd < chunk) {
+                        close(file_handles[h]);
+                        file_handles[h] = 0;
+                        next_h = 0;
+                    }
+
+                    int rep_payload_len = 6 + rd;
+                    uint8_t rep[2048];
+                    rep[0] = rep_payload_len & 0xFF;
+                    rep[1] = (rep_payload_len >> 8) & 0xFF;
+                    rep[2] = (uint8_t)(counter & 0xFF);
+                    rep[3] = (uint8_t)((counter >> 8) & 0xFF);
+                    rep[4] = 0x03;
+                    rep[5] = 0x95;
+                    rep[6] = 0x00; /* SUCCESS */
+                    rep[7] = next_h;
+                    memcpy(&rep[8], payload, rd);
+
+                    send(client_fd, rep, 2 + rep_payload_len, MSG_NOSIGNAL);
+                    fprintf(stderr, "[EV3 COM] CONTINUE_UPLOAD: Sent %zd bytes (handle=%d)\n", rd, next_h);
+                } else {
+                    uint8_t rep[7] = {
+                        0x05, 0x00,
+                        (uint8_t)(counter & 0xFF), (uint8_t)((counter >> 8) & 0xFF),
+                        0x05, 0x95, 0x05
+                    };
+                    send(client_fd, rep, 7, MSG_NOSIGNAL);
                 }
             } else if (sys_cmd == 0x99) {
                 /* LIST_FILES: buf[6..7] = max_len, buf[8...] = path */
@@ -1057,7 +1298,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                 rep[10] = (unsigned char)((list_len >> 24) & 0xFF);
                 rep[11] = 0x00; /* Handle: 0 = list completed in one chunk */
                 memcpy(&rep[12], list_str, list_len);
-                send(client_fd, rep, 2 + rep_payload_len, 0);
+                send(client_fd, rep, 2 + rep_payload_len, MSG_NOSIGNAL);
                 fprintf(stderr, "[EV3 COM] LIST_FILES (%s): returned %d bytes (list_len=%d):\n%s", target_dir, 2 + rep_payload_len, list_len, list_str);
             } else if (sys_cmd == 0x9B) {
                 /* CREATE_DIR */
@@ -1072,7 +1313,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
                     0x03, 0x9B, 0x00
                 };
-                send(client_fd, rep, 7, 0);
+                send(client_fd, rep, 7, MSG_NOSIGNAL);
             } else if (sys_cmd == 0x9C) {
                 /* DELETE_FILE */
                 char *filename = (char *)&buf[6];
@@ -1081,12 +1322,13 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                 unlink(safe_path);
                 rmdir(safe_path);
                 ev3_sync_to_guest('R', ev3_clean_relpath(filename), NULL, 0);
+                fprintf(stderr, "[EV3 COM] DELETE_FILE: %s -> %s\n", filename, safe_path);
                 unsigned char rep[7] = {
                     0x05, 0x00,
                     (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
                     0x03, 0x9C, 0x00
                 };
-                send(client_fd, rep, 7, 0);
+                send(client_fd, rep, 7, MSG_NOSIGNAL);
             } else if (cmd_type == 0x01) {
                 /* Generic system reply */
                 unsigned char rep[7] = {
@@ -1094,7 +1336,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
                     0x03, sys_cmd, 0x00
                 };
-                send(client_fd, rep, 7, 0);
+                send(client_fd, rep, 7, MSG_NOSIGNAL);
             }
         } else {
             /* Direct Command */
@@ -1536,8 +1778,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                         }
                     }
                 } else {
-                    /* Skip unknown opcode */
-                    pc++;
+                    /* Skip unknown opcode: op was already consumed at loop top */
                 }
             }
 
@@ -1557,7 +1798,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                 if (rep_globals > 0) {
                     memcpy(&rep[5], globals, rep_globals);
                 }
-                send(client_fd, rep, 2 + rep_len, 0);
+                send(client_fd, rep, 2 + rep_len, MSG_NOSIGNAL);
                 fprintf(stderr, "[EV3 COM] Sent Direct Reply (%d bytes, globals=%d)\n", 2 + rep_len, rep_globals);
                 g_free(rep);
             }
@@ -1572,6 +1813,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
 
 static void *ev3_tcp_server_worker(void *opaque)
 {
+    signal(SIGPIPE, SIG_IGN);
     EV3ComServer *srv = opaque;
     fprintf(stderr, "[EV3 COM] TCP server worker thread started...\n");
     int server_fd = -1;
