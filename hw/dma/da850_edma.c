@@ -533,6 +533,8 @@ static bool da850_edma_step(DA850EDMAState *s,
                        buf,
                        c->acnt);
 
+
+
     address_space_write(&address_space_memory,
                         c->cur_dst,
                         MEMTXATTRS_UNSPECIFIED,
@@ -622,6 +624,8 @@ static void da850_edma_run_spi_pair(DA850EDMAState *s,
 
     rx = &s->chan[rx_chan];
     tx = &s->chan[tx_chan];
+
+
 
     /*fprintf(stderr,
             "EDMA: SPI pair "
@@ -766,6 +770,8 @@ static void da850_edma_arm(DA850EDMAState *s,
     da850_edma_load_from_parm(s, chan);
 
     c->armed = true;
+
+
 
     /*
      * Clear pending event.

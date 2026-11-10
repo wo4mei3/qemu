@@ -33,6 +33,7 @@
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "hw/block/flash.h"
 #include "trace.h"
 #include "qom/object.h"
 #include "m25p80_sfdp.h"
@@ -1829,3 +1830,9 @@ static void m25p80_register_types(void)
 }
 
 type_init(m25p80_register_types)
+
+uint8_t *m25p80_get_storage(DeviceState *d)
+{
+    Flash *s = (Flash *)d;
+    return s ? s->storage : NULL;
+}

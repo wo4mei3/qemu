@@ -44,7 +44,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DA850SPIState, DA850_SPI)
 #define SPIGCR1_LOOPBACK_MASK  (1u << 16)
 #define SPIGCR1_SPIENA_MASK    (1u << 24)
 
-#define SPIDAT1_CSHOLD_MASK (1u << 12)
+#define SPIDAT1_CSHOLD_MASK ((1u << 28) | (1u << 12))
 /* NOTE: davinci_spi encodes which CS line(s) to assert somewhere in
  * SPIDAT1 (a CSNR-style field), but the exact bit position was not
  * verified against the TRM. Since this board only ever has one device
@@ -94,25 +94,15 @@ static void da850_spi_do_transfer(DA850SPIState *s)
 {
     uint8_t tx = (uint8_t)(s->dat1 & 0xff);
     uint8_t rx;
-/*fprintf(stderr,
-        "SPI: TRANSFER TX=%02x\n",
-        (unsigned)(s->dat1 & 0xff));*/
     if (!(s->gcr1 & SPIGCR1_SPIENA_MASK)) {
-        /* Controller not enabled: don't touch the SSI bus. */
         return;
     }
-
     da850_spi_select_cs0(s);
-
     rx = ssi_transfer(s->ssi, tx);
-
     s->buf = rx & 0xff;
-    s->buf &= ~SPIBUF_RXEMPTY_MASK; /* data available */
-    s->buf &= ~SPIBUF_TXFULL_MASK;  /* transmitter ready again */
-
+    s->buf &= ~SPIBUF_RXEMPTY_MASK;
+    s->buf &= ~SPIBUF_TXFULL_MASK;
     if (!(s->dat1 & SPIDAT1_CSHOLD_MASK)) {
-        /* Deselect all chip selects once the (last) word of a
-         * transaction completes. */
         for (int i = 0; i < SPI_MAX_CS; i++) {
             qemu_set_irq(s->cs_lines[i], 1);
         }
@@ -146,11 +136,6 @@ static void da850_spi_write(void *opaque, hwaddr addr,
                              uint64_t val, unsigned size)
 {
     DA850SPIState *s = opaque;
-    /*fprintf(stderr,
-        "SPI: WRITE addr=%08x value=%08x size=%u\n",
-        (unsigned)addr,
-        (unsigned)val,
-        size);*/
     switch (addr) {
     case SPIGCR0:
         s->gcr0 = val;
@@ -188,11 +173,21 @@ static void da850_spi_write(void *opaque, hwaddr addr,
         break;
     }
     case SPIDAT1:
-        s->dat1 = val;
-        /*fprintf(stderr, "SPI: SPIDAT1 WRITE tx=0x%02x (gcr1=0x%08x)\n",
-                (unsigned)(val & 0xff), s->gcr1);*/
+        if (size == 4) {
+            s->dat1 = val;
+        } else if (size == 2) {
+            s->dat1 = (s->dat1 & 0xffff0000u) | (val & 0xffffu);
+        } else {
+            s->dat1 = (s->dat1 & 0xffffff00u) | (val & 0xffu);
+        }
         da850_spi_do_transfer(s);
-        /*fprintf(stderr, "SPI: SPIBUF after transfer = 0x%08x\n", s->buf);*/   
+        break;
+    case SPIDAT1 + 2:
+        if (size == 2) {
+            s->dat1 = (s->dat1 & 0x0000ffffu) | ((val & 0xffffu) << 16);
+        } else {
+            s->dat1 = (s->dat1 & 0x00ffffffu) | ((val & 0xffu) << 24);
+        }
         break;
     case SPIDELAY:
         s->delay = val;

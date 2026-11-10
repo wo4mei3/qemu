@@ -34,7 +34,10 @@
 #include "hw/usb/hcd-musb.h"
 #include "ui/input.h"
 #include "audio/audio.h"
+#include "qemu/thread.h"
 #include <math.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 #define VERSATILE_FLASH_ADDR 0x34000000
 #define VERSATILE_FLASH_SIZE (64 * 1024 * 1024)
@@ -305,6 +308,1325 @@ static void ev3_sound_init(EV3SoundState *s)
     if (s->voice) {
         AUD_set_active_out(s->voice, 1);
     }
+}
+
+/* ========================================================================= */
+/* EV3 Native Communication & Wi-Fi Discovery Subsystem (No Python required) */
+/* ========================================================================= */
+
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+#define EV3_WIFI_UDP_PORT 3015
+#define EV3_TCP_PORT      5555
+#define EV3_SERIAL_NUM    "001653123456"
+#define EV3_BRICK_NAME    "EV3"
+
+typedef struct {
+    DA850SimplePeripherals *sp;
+    QemuThread discovery_thread;
+    QemuThread tcp_thread;
+} EV3ComServer;
+
+typedef struct {
+    DA850SimplePeripherals *sp;
+    uint32_t dur_ms;
+} ToneStopArg;
+
+static void *ev3_tone_stop_worker(void *opaque)
+{
+    ToneStopArg *arg = opaque;
+    g_usleep((gulong)arg->dur_ms * 1000);
+    arg->sp->sound.enabled = false;
+    g_free(arg);
+    return NULL;
+}
+
+static MemoryRegion *ev3_ram_mr = NULL;
+static uint32_t ev3_usb_phys_bss = 0;
+
+static uint32_t ev3_get_usb_bss(void)
+{
+    if (!ev3_ram_mr) return 0;
+
+    uint8_t *ram = memory_region_get_ram_ptr(ev3_ram_mr);
+    if (!ram) return 0;
+
+    uint32_t ram_size = memory_region_size(ev3_ram_mr);
+
+    if (ev3_usb_phys_bss && ev3_usb_phys_bss < ram_size) {
+        return ev3_usb_phys_bss;
+    }
+
+    static const uint8_t pat[] = {
+        0x0d, 0xc0, 0xa0, 0xe1, 0x30, 0xd8, 0x2d, 0xe9,
+        0x04, 0xb0, 0x4c, 0xe2, 0x50, 0x40, 0x9f, 0xe5,
+        0x01, 0x00, 0xa0, 0xe1, 0x08, 0x38, 0x94, 0xe5
+    };
+
+    for (uint32_t off = 0x00100000; off < ram_size - 0x1000; off += 4) {
+        if (memcmp(ram + off, pat, sizeof(pat)) == 0) {
+            uint32_t va_bss = *(uint32_t *)(ram + off + 0x64);
+            if (va_bss >= 0xbf000000 && va_bss < 0xc0000000) {
+                uint32_t pgd_idx = va_bss >> 20;
+                uint32_t pgd_entry = *(uint32_t *)(ram + 0x4000 + pgd_idx * 4);
+                if ((pgd_entry & 3) == 1) {
+                    uint32_t pt_base = (pgd_entry & ~0x3ff) - 0xc0000000;
+                    uint32_t pt_idx = (va_bss >> 12) & 0xff;
+                    if (pt_base < ram_size) {
+                        uint32_t pte = *(uint32_t *)(ram + pt_base + pt_idx * 4);
+                        uint32_t phys_bss = (pte & ~0xfff) - 0xc0000000 + (va_bss & 0xfff);
+                        if (phys_bss < ram_size) {
+                            ev3_usb_phys_bss = phys_bss;
+                            fprintf(stderr, "[EV3 USB BRIDGE] Found d_usbdev bss at physical 0x%08x (VA 0x%08x)!\n",
+                                    phys_bss, va_bss);
+                            return ev3_usb_phys_bss;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static bool ev3_usb_send_packet(const uint8_t *pkt, size_t len,
+                                uint8_t *rep, size_t *rep_len, int timeout_ms)
+{
+    uint32_t bss = ev3_get_usb_bss();
+    if (!bss || !ev3_ram_mr) return false;
+
+    uint8_t *ram = memory_region_get_ram_ptr(ev3_ram_mr);
+    if (!ram) return false;
+
+    volatile uint8_t *buf_out = ram + bss + 1;
+    volatile uint8_t *buf_in = ram + bss + 0x401;
+    volatile uint32_t *len_in = (volatile uint32_t *)(ram + bss + 0x804);
+    volatile uint32_t *len_out = (volatile uint32_t *)(ram + bss + 0x808);
+    volatile uint32_t *state_80c = (volatile uint32_t *)(ram + bss + 0x80c);
+
+    /* Keep d_usbdev internal state at 0 so it never attempts to DMA to NULL USB endpoints */
+    *state_80c = 0;
+
+    int wait_cnt = 0;
+    while (*len_out > 0 && wait_cnt < 200) {
+        *state_80c = 0;
+        g_usleep(2000);
+        wait_cnt++;
+    }
+    if (*len_out > 0) {
+        fprintf(stderr, "[EV3 USB BRIDGE] Out buffer busy (len_out=%u) timed out!\n", *len_out);
+        return false;
+    }
+
+    *state_80c = 0;
+    *len_in = 0;
+    memcpy((void *)buf_out, pkt, len);
+    *len_out = (uint32_t)len;
+
+    if (rep && rep_len) {
+        int waited = 0;
+        int max_wait = timeout_ms * 1000;
+        while (*len_in == 0 && waited < max_wait) {
+            *state_80c = 0;
+            g_usleep(2000);
+            waited += 2000;
+        }
+        if (*len_in == 0) {
+            fprintf(stderr, "[EV3 USB BRIDGE] Reply timed out after %d ms (cmd=0x%02x, len_out=%u)!\n",
+                    timeout_ms, len > 5 ? pkt[5] : 0, *len_out);
+            return false;
+        }
+        uint32_t chunk_len = *len_in;
+        if (chunk_len > 1024) chunk_len = 1024;
+        memcpy(rep, (void *)buf_in, chunk_len);
+        *len_in = 0;
+        *state_80c = 0;
+
+        size_t total_received = chunk_len;
+        if (total_received >= 2) {
+            uint16_t expected_total = (rep[0] | (rep[1] << 8)) + 2;
+            while (total_received < expected_total && total_received < 2048) {
+                waited = 0;
+                while (*len_in == 0 && waited < 500000) { /* 500ms between chunks */
+                    *state_80c = 0;
+                    g_usleep(2000);
+                    waited += 2000;
+                }
+                if (*len_in == 0) break;
+                uint32_t next_chunk = *len_in;
+                if (total_received + next_chunk > 2048) {
+                    next_chunk = 2048 - total_received;
+                }
+                memcpy(rep + total_received, (void *)buf_in, next_chunk);
+                total_received += next_chunk;
+                *len_in = 0;
+                *state_80c = 0;
+            }
+            if (total_received > expected_total) {
+                total_received = expected_total;
+            }
+        }
+        *rep_len = total_received;
+        return true;
+    }
+    return true;
+}
+
+static void *ev3_discovery_worker(void *opaque)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        fprintf(stderr, "[EV3 COM] UDP socket failed: %s\n", strerror(errno));
+        return NULL;
+    }
+
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port = 0; /* Ephemeral port so replies return directly */
+    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        fprintf(stderr, "[EV3 COM] UDP bind failed: %s\n", strerror(errno));
+        close(sock);
+        return NULL;
+    }
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    fprintf(stderr, "[EV3 COM] Discovery worker active (broadcasting on UDP %d)...\n", EV3_WIFI_UDP_PORT);
+
+    while (!ev3_get_usb_bss()) {
+        g_usleep(500000);
+    }
+    fprintf(stderr, "[EV3 COM] LMS2012 ready, starting UDP broadcast...\n");
+
+    const char *payload = 
+        "Serial-Number: " EV3_SERIAL_NUM "\r\n"
+        "Port: " STR(EV3_TCP_PORT) "\r\n"
+        "Name: " EV3_BRICK_NAME "\r\n"
+        "Protocol: EV3\r\n";
+    int payload_len = strlen(payload);
+
+    struct sockaddr_in bcast_addr;
+    memset(&bcast_addr, 0, sizeof(bcast_addr));
+    bcast_addr.sin_family = AF_INET;
+    bcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
+    bcast_addr.sin_port = htons(EV3_WIFI_UDP_PORT);
+
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    local_addr.sin_port = htons(EV3_WIFI_UDP_PORT);
+
+    char host_ip[256] = { 0 };
+    FILE *rf = fopen("/etc/resolv.conf", "r");
+    if (rf) {
+        char line[256];
+        while (fgets(line, sizeof(line), rf)) {
+            if (strncmp(line, "nameserver", 10) == 0) {
+                char *ip = line + 10;
+                while (*ip == ' ' || *ip == '\t') ip++;
+                char *end = ip;
+                while (*end && *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') end++;
+                *end = '\0';
+                if (*ip && strcmp(ip, "127.0.0.1") != 0 && strcmp(ip, "8.8.8.8") != 0) {
+                    g_strlcpy(host_ip, ip, sizeof(host_ip));
+                }
+            }
+        }
+        fclose(rf);
+    }
+
+    struct sockaddr_in host_addr;
+    memset(&host_addr, 0, sizeof(host_addr));
+    if (host_ip[0] != '\0') {
+        host_addr.sin_family = AF_INET;
+        host_addr.sin_addr.s_addr = inet_addr(host_ip);
+        host_addr.sin_port = htons(EV3_WIFI_UDP_PORT);
+        fprintf(stderr, "[EV3 COM] Discovery targeting Windows host at %s:%d\n", host_ip, EV3_WIFI_UDP_PORT);
+    }
+
+    while (1) {
+        sendto(sock, payload, payload_len, 0, (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
+        sendto(sock, payload, payload_len, 0, (struct sockaddr *)&local_addr, sizeof(local_addr));
+        if (host_ip[0] != '\0') {
+            sendto(sock, payload, payload_len, 0, (struct sockaddr *)&host_addr, sizeof(host_addr));
+        }
+
+        /* 1. Send to all interface broadcast addresses (WSL2 subnet broadcast) */
+        struct ifaddrs *ifaddr, *ifa;
+        if (getifaddrs(&ifaddr) != -1) {
+            for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+                if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+                if ((ifa->ifa_flags & IFF_BROADCAST) && ifa->ifa_broadaddr) {
+                    struct sockaddr_in baddr = *(struct sockaddr_in *)ifa->ifa_broadaddr;
+                    baddr.sin_port = htons(EV3_WIFI_UDP_PORT);
+                    sendto(sock, payload, payload_len, 0, (struct sockaddr *)&baddr, sizeof(baddr));
+                }
+            }
+            freeifaddrs(ifaddr);
+        }
+
+        /* 2. Send directly to default gateway (Windows host in WSL2) */
+        FILE *rf_gw = fopen("/proc/net/route", "r");
+        if (rf_gw) {
+            char rline[256];
+            while (fgets(rline, sizeof(rline), rf_gw)) {
+                char ifname[32];
+                unsigned long dest = 0, gw = 0;
+                if (sscanf(rline, "%31s %lx %lx", ifname, &dest, &gw) == 3) {
+                    if (dest == 0 && gw != 0) {
+                        struct sockaddr_in gw_addr;
+                        memset(&gw_addr, 0, sizeof(gw_addr));
+                        gw_addr.sin_family = AF_INET;
+                        gw_addr.sin_addr.s_addr = gw;
+                        gw_addr.sin_port = htons(EV3_WIFI_UDP_PORT);
+                        sendto(sock, payload, payload_len, 0, (struct sockaddr *)&gw_addr, sizeof(gw_addr));
+                    }
+                }
+            }
+            fclose(rf_gw);
+        }
+
+        for (int i = 0; i < 5; i++) {
+            char ack_buf[128];
+            struct sockaddr_in client_addr;
+            socklen_t addr_len = sizeof(client_addr);
+            int rx = recvfrom(sock, ack_buf, sizeof(ack_buf) - 1, 0, (struct sockaddr *)&client_addr, &addr_len);
+            if (rx > 0) {
+                /* Reply directly to discovering client */
+                sendto(sock, payload, payload_len, 0, (struct sockaddr *)&client_addr, addr_len);
+            }
+            g_usleep(500000);
+        }
+    }
+    close(sock);
+    return NULL;
+}
+
+static int ev3_decode_par(const unsigned char *p, int max_len, int *val, bool *is_global, int *consumed)
+{
+    if (max_len < 1) return -1;
+    unsigned char b = p[0];
+    if ((b & 0x80) == 0) {
+        *consumed = 1;
+        if ((b & 0x40) == 0) {
+            *is_global = false;
+            if ((b & 0x20) == 0) {
+                *val = b & 0x1F;
+            } else {
+                *val = (int)(b & 0x1F) - 32;
+            }
+        } else {
+            *val = b & 0x1F;
+            *is_global = ((b & 0x20) != 0);
+        }
+        return 0;
+    } else {
+        int type = b & 0x07;
+        if ((b & 0x40) == 0) {
+            *is_global = false;
+            if (type == 0 || type == 1) {
+                if (max_len < 2) return -1;
+                *val = (signed char)p[1];
+                *consumed = 2;
+            } else if (type == 2) {
+                if (max_len < 3) return -1;
+                *val = (int16_t)(p[1] | (p[2] << 8));
+                *consumed = 3;
+            } else if (type == 3) {
+                if (max_len < 5) return -1;
+                *val = (int32_t)(p[1] | (p[2] << 8) | (p[3] << 16) | (p[4] << 24));
+                *consumed = 5;
+            } else {
+                *val = 0;
+                *consumed = 1;
+            }
+            return 0;
+        } else {
+            *is_global = ((b & 0x20) != 0);
+            if (type == 0 || type == 1) {
+                if (max_len < 2) return -1;
+                *val = p[1];
+                *consumed = 2;
+            } else if (type == 2) {
+                if (max_len < 3) return -1;
+                *val = p[1] | (p[2] << 8);
+                *consumed = 3;
+            } else if (type == 3) {
+                if (max_len < 5) return -1;
+                *val = (int32_t)(p[1] | (p[2] << 8) | (p[3] << 16) | (p[4] << 24));
+                *consumed = 5;
+            } else {
+                *val = 0;
+                *consumed = 1;
+            }
+            return 0;
+        }
+    }
+}
+
+static int ev3_decode_str(const unsigned char *p, int max_len, const char **str_out, int *consumed)
+{
+    if (max_len < 1) return -1;
+    if (p[0] == 0x84 || p[0] == 0x80) {
+        /* LCS null-terminated string */
+        *str_out = (const char *)&p[1];
+        int len = 0;
+        while (1 + len < max_len && p[1 + len] != '\0') {
+            len++;
+        }
+        *consumed = 1 + len + (1 + len < max_len ? 1 : 0);
+        return 0;
+    } else if (p[0] == 0x00) {
+        *str_out = "";
+        *consumed = 1;
+        return 0;
+    } else if (p[0] >= 0x20 && p[0] <= 0x7E) {
+        /* Bare string without 0x84 prefix */
+        *str_out = (const char *)p;
+        int len = 0;
+        while (len < max_len && p[len] != '\0') {
+            len++;
+        }
+        *consumed = len + (len < max_len ? 1 : 0);
+        return 0;
+    } else {
+        *str_out = "";
+        *consumed = 1;
+        return 0;
+    }
+}
+
+static void ev3_mkdir_p(const char *path)
+{
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+static const char *ev3_clean_relpath(const char *path)
+{
+    const char *p = path ? path : "";
+    while (*p == '.' || *p == '/') p++;
+    if (strncmp(p, "home/root/lms2012/prjs", 22) == 0) {
+        p += 22;
+        while (*p == '/') p++;
+    } else if (strncmp(p, "mnt/ramdisk/prjs", 16) == 0) {
+        p += 16;
+        while (*p == '/') p++;
+    }
+    if (strncmp(p, "prjs", 4) == 0) {
+        p += 4;
+        while (*p == '/') p++;
+    } else if (strncasecmp(p, "projects", 8) == 0) {
+        p += 8;
+        while (*p == '/') p++;
+    }
+    while (*p == '/') p++;
+    return p;
+}
+
+static void ev3_resolve_path(const char *ev3_path, char *out, size_t out_sz)
+{
+    mkdir("/tmp/ev3_prjs", 0755);
+    mkdir("/tmp/ev3_prjs/BrkProg_SAVE", 0755);
+
+    const char *p = ev3_clean_relpath(ev3_path);
+
+    if (*p == '\0') {
+        snprintf(out, out_sz, "/tmp/ev3_prjs");
+    } else {
+        snprintf(out, out_sz, "/tmp/ev3_prjs/%s", p);
+        size_t len = strlen(out);
+        if (len > 0 && out[len - 1] == '/') {
+            out[len - 1] = '\0';
+        }
+    }
+}
+
+static void ev3_sync_to_guest(char cmd, const char *path, const void *data, size_t data_len)
+{
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) return;
+
+    struct sockaddr_un sun_addr;
+    memset(&sun_addr, 0, sizeof(sun_addr));
+    sun_addr.sun_family = AF_UNIX;
+    snprintf(sun_addr.sun_path, sizeof(sun_addr.sun_path), "/tmp/ev3_guest_bridge.sock");
+
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    if (connect(sock, (struct sockaddr *)&sun_addr, sizeof(sun_addr)) < 0) {
+        close(sock);
+        return;
+    }
+
+    unsigned short plen = path ? strlen(path) : 0;
+    if (cmd == 'D' || cmd == 'R') {
+        send(sock, &cmd, 1, 0);
+        send(sock, &plen, 2, 0);
+        if (plen > 0) send(sock, path, plen, 0);
+        unsigned char ack = 0;
+        recv(sock, &ack, 1, 0);
+    } else if (cmd == 'F') {
+        unsigned int flen = data_len;
+        send(sock, &cmd, 1, 0);
+        send(sock, &plen, 2, 0);
+        send(sock, &flen, 4, 0);
+        if (plen > 0) send(sock, path, plen, 0);
+        if (flen > 0 && data) {
+            send(sock, data, flen, 0);
+        }
+        unsigned char ack = 0;
+        recv(sock, &ack, 1, 0);
+    }
+    close(sock);
+    fprintf(stderr, "[EV3 COM] ev3_sync_to_guest: cmd='%c' path='%s' (%zu bytes) synced to guest!\n", cmd, path ? path : "", data_len);
+}
+
+static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
+{
+    unsigned char buf[1024];
+    int file_handles[8] = { 0 };
+    char file_ev3_paths[8][1024] = { { 0 } };
+    char file_safe_paths[8][1024] = { { 0 } };
+    bool is_prg_running = false;
+
+    fprintf(stderr, "[EV3 COM] Client connected on TCP 5555!\n");
+
+    int wait_bss = 0;
+    while (!ev3_get_usb_bss() && wait_bss < 60) {
+        g_usleep(500000);
+        wait_bss++;
+    }
+
+    while (1) {
+        unsigned char hdr[2];
+        int n = recv(client_fd, hdr, 2, MSG_WAITALL);
+        if (n != 2) {
+            fprintf(stderr, "[EV3 COM] recv header failed (n=%d)\n", n);
+            break;
+        }
+
+        /* Check for official software VMTP1.0 unlock handshake */
+        if (hdr[0] == 'G' && hdr[1] == 'E') {
+            char http_buf[512] = { 'G', 'E' };
+            int rn = 2;
+            while (rn < (int)sizeof(http_buf) - 1) {
+                char ch = 0;
+                int r = recv(client_fd, &ch, 1, 0);
+                if (r <= 0) break;
+                http_buf[rn++] = ch;
+                if ((rn >= 4 && memcmp(&http_buf[rn - 4], "\r\n\r\n", 4) == 0) ||
+                    (rn >= 2 && memcmp(&http_buf[rn - 2], "\n\n", 2) == 0)) {
+                    break;
+                }
+            }
+            http_buf[rn] = '\0';
+            fprintf(stderr, "[EV3 COM] Received VMTP unlock request (%d bytes): %s\n", rn, http_buf);
+            send(client_fd, "Accept:EV340\r\n\r\n", 16, 0);
+            fprintf(stderr, "[EV3 COM] Sent Accept:EV340 response\n");
+            continue;
+        }
+
+        int pkt_len = hdr[0] | (hdr[1] << 8);
+        if (pkt_len <= 0 || pkt_len > 1000) {
+            fprintf(stderr, "[EV3 COM] Invalid pkt_len=%d (0x%02x 0x%02x)\n", pkt_len, hdr[0], hdr[1]);
+            break;
+        }
+
+        buf[0] = hdr[0];
+        buf[1] = hdr[1];
+        n = recv(client_fd, &buf[2], pkt_len, MSG_WAITALL);
+        if (n != pkt_len) {
+            fprintf(stderr, "[EV3 COM] Incomplete body read (n=%d, expected=%d)\n", n, pkt_len);
+            break;
+        }
+        buf[2 + pkt_len] = '\0';
+
+        fprintf(stderr, "[EV3 COM] Pkt (%d bytes): ", 2 + pkt_len);
+        for (int i = 0; i < 2 + pkt_len && i < 32; i++) {
+            fprintf(stderr, "%02x ", buf[i]);
+        }
+        fprintf(stderr, "\n");
+
+        unsigned short counter = buf[2] | (buf[3] << 8);
+        unsigned char cmd_type = buf[4];
+
+        bool has_reply = (cmd_type == 0x00 || cmd_type == 0x01);
+        uint8_t rep_buf[2048];
+        size_t rep_sz = 0;
+        if (ev3_usb_send_packet(buf, 2 + pkt_len, has_reply ? rep_buf : NULL, has_reply ? &rep_sz : NULL, 2000)) {
+            if (has_reply && rep_sz > 0) {
+                send(client_fd, rep_buf, rep_sz, 0);
+                fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes)\n", rep_sz);
+            }
+            continue;
+        }
+
+        if (cmd_type == 0x01 || cmd_type == 0x81) {
+            /* System Command */
+            unsigned char sys_cmd = buf[5];
+            if (sys_cmd == 0x92) {
+                /* BEGIN_DOWNLOAD: buf[6..9] = filesize, buf[10...] = filename */
+                char *filename = (char *)&buf[10];
+                char safe_path[512];
+                ev3_resolve_path(filename, safe_path, sizeof(safe_path));
+
+                /* ensure parent directory exists */
+                char parent[512];
+                snprintf(parent, sizeof(parent), "%s", safe_path);
+                char *slash = strrchr(parent, '/');
+                if (slash && slash != parent) {
+                    *slash = '\0';
+                    ev3_mkdir_p(parent);
+                }
+
+                fprintf(stderr, "[EV3 COM] BEGIN_DOWNLOAD: %s (saving to %s)\n", filename, safe_path);
+
+                int h = 1;
+                for (int i = 1; i < 8; i++) {
+                    if (file_handles[i] <= 0) { h = i; break; }
+                }
+                int fd = open(safe_path, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+                if (fd >= 0) {
+                    file_handles[h] = fd;
+                    snprintf(file_ev3_paths[h], sizeof(file_ev3_paths[h]), "%.1000s", filename);
+                    snprintf(file_safe_paths[h], sizeof(file_safe_paths[h]), "%.1000s", safe_path);
+                    if (cmd_type == 0x01) {
+                        unsigned char rep[8] = {
+                            0x06, 0x00,
+                            (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                            0x03, 0x92, 0x00, (unsigned char)h
+                        };
+                        send(client_fd, rep, 8, 0);
+                    }
+                } else {
+                    if (cmd_type == 0x01) {
+                        unsigned char rep[8] = {
+                            0x06, 0x00,
+                            (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                            0x03, 0x92, 0x05, 0x00
+                        };
+                        send(client_fd, rep, 8, 0);
+                    }
+                }
+            } else if (sys_cmd == 0x93) {
+                /* CONTINUE_DOWNLOAD */
+                unsigned char h = buf[6];
+                int chunk_len = (2 + pkt_len) - 7;
+                if (h < 8 && file_handles[h] > 0 && chunk_len > 0) {
+                    if (write(file_handles[h], &buf[7], chunk_len) < 0) {
+                        /* write error */
+                    }
+                }
+                if (cmd_type == 0x01) {
+                    unsigned char rep[8] = {
+                        0x06, 0x00,
+                        (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                        0x03, 0x93, 0x00, h
+                    };
+                    send(client_fd, rep, 8, 0);
+                }
+            } else if (sys_cmd == 0x98 || sys_cmd == 0x94) {
+                /* CLOSE_FILEHANDLE: official EV3 command is 0x98 (0x94 also supported) */
+                unsigned char h = buf[6];
+                fprintf(stderr, "[EV3 COM] CLOSE_FILEHANDLE: handle %d (sys_cmd=0x%02x, download finished!)\n", h, sys_cmd);
+                if (h < 8 && file_handles[h] > 0) {
+                    close(file_handles[h]);
+                    file_handles[h] = 0;
+
+                    /* Send immediate success reply to PC before syncing */
+                    if (cmd_type == 0x01) {
+                        unsigned char rep[8] = {
+                            0x06, 0x00,
+                            (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                            0x03, sys_cmd, 0x00, h
+                        };
+                        send(client_fd, rep, 8, 0);
+                    }
+
+                    /* Sync to EV3 guest at /mnt/ramdisk/prjs/<Project>/<Program> */
+                    if (file_safe_paths[h][0] != '\0') {
+                        FILE *fp = fopen(file_safe_paths[h], "rb");
+                        if (fp) {
+                            fseek(fp, 0, SEEK_END);
+                            long fsz = ftell(fp);
+                            fseek(fp, 0, SEEK_SET);
+                            void *fdata = malloc(fsz);
+                            if (fdata) {
+                                if (fread(fdata, 1, fsz, fp) == (size_t)fsz) {
+                                    ev3_sync_to_guest('F', ev3_clean_relpath(file_ev3_paths[h]), fdata, fsz);
+                                }
+                                free(fdata);
+                            }
+                            fclose(fp);
+                        }
+                    }
+
+                    /* Play download chime on brick */
+                    if (sp) {
+                        sp->sound.freq_hz = 1200;
+                        sp->sound.volume = 60;
+                        sp->sound.enabled = true;
+                        ToneStopArg *stop_arg = g_new0(ToneStopArg, 1);
+                        stop_arg->sp = sp;
+                        stop_arg->dur_ms = 150;
+                        QemuThread th;
+                        qemu_thread_create(&th, "ev3-tone-stop", ev3_tone_stop_worker, stop_arg, QEMU_THREAD_DETACHED);
+                    }
+                } else {
+                    if (cmd_type == 0x01) {
+                        unsigned char rep[7] = {
+                            0x05, 0x00,
+                            (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                            0x03, sys_cmd, 0x00
+                        };
+                        send(client_fd, rep, 7, 0);
+                    }
+                }
+            } else if (sys_cmd == 0x99) {
+                /* LIST_FILES: buf[6..7] = max_len, buf[8...] = path */
+                char req_path[256] = { 0 };
+                if (pkt_len > 6) {
+                    snprintf(req_path, sizeof(req_path), "%.128s", (char *)&buf[8]);
+                }
+                char target_dir[512];
+                ev3_resolve_path(req_path, target_dir, sizeof(target_dir));
+
+                char list_str[2048] = { 0 };
+                int list_len = 0;
+
+                DIR *dir = opendir(target_dir);
+                if (dir) {
+                    struct dirent *ent;
+                    while ((ent = readdir(dir)) != NULL) {
+                        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                        char full_entry[1024];
+                        snprintf(full_entry, sizeof(full_entry), "%s/%s", target_dir, ent->d_name);
+                        struct stat st;
+                        if (stat(full_entry, &st) == 0) {
+                            if (S_ISDIR(st.st_mode)) {
+                                list_len += snprintf(list_str + list_len, sizeof(list_str) - list_len, "%s/\n", ent->d_name);
+                            } else {
+                                list_len += snprintf(list_str + list_len, sizeof(list_str) - list_len,
+                                                     "00000000000000000000000000000000 %08x %s\n",
+                                                     (unsigned int)st.st_size, ent->d_name);
+                            }
+                        }
+                    }
+                    closedir(dir);
+                }
+
+                if (list_len == 0 && strcmp(target_dir, "/tmp/ev3_prjs") == 0) {
+                    list_len = snprintf(list_str, sizeof(list_str), "BrkProg_SAVE/\n");
+                }
+
+                int rep_payload_len = 10 + list_len;
+                unsigned char rep[2048];
+                rep[0] = rep_payload_len & 0xFF;
+                rep[1] = (rep_payload_len >> 8) & 0xFF;
+                rep[2] = (unsigned char)(counter & 0xFF);
+                rep[3] = (unsigned char)((counter >> 8) & 0xFF);
+                rep[4] = 0x03; /* SYSTEM_REPLY */
+                rep[5] = 0x99; /* LIST_FILES */
+                rep[6] = 0x00; /* SUCCESS */
+                rep[7] = (unsigned char)(list_len & 0xFF);
+                rep[8] = (unsigned char)((list_len >> 8) & 0xFF);
+                rep[9] = (unsigned char)((list_len >> 16) & 0xFF);
+                rep[10] = (unsigned char)((list_len >> 24) & 0xFF);
+                rep[11] = 0x00; /* Handle: 0 = list completed in one chunk */
+                memcpy(&rep[12], list_str, list_len);
+                send(client_fd, rep, 2 + rep_payload_len, 0);
+                fprintf(stderr, "[EV3 COM] LIST_FILES (%s): returned %d bytes (list_len=%d):\n%s", target_dir, 2 + rep_payload_len, list_len, list_str);
+            } else if (sys_cmd == 0x9B) {
+                /* CREATE_DIR */
+                char *dirpath = (char *)&buf[6];
+                char safe_path[512];
+                ev3_resolve_path(dirpath, safe_path, sizeof(safe_path));
+                mkdir(safe_path, 0755);
+                ev3_sync_to_guest('D', ev3_clean_relpath(dirpath), NULL, 0);
+                fprintf(stderr, "[EV3 COM] CREATE_DIR: %s -> %s\n", dirpath, safe_path);
+                unsigned char rep[7] = {
+                    0x05, 0x00,
+                    (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                    0x03, 0x9B, 0x00
+                };
+                send(client_fd, rep, 7, 0);
+            } else if (sys_cmd == 0x9C) {
+                /* DELETE_FILE */
+                char *filename = (char *)&buf[6];
+                char safe_path[512];
+                ev3_resolve_path(filename, safe_path, sizeof(safe_path));
+                unlink(safe_path);
+                rmdir(safe_path);
+                ev3_sync_to_guest('R', ev3_clean_relpath(filename), NULL, 0);
+                unsigned char rep[7] = {
+                    0x05, 0x00,
+                    (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                    0x03, 0x9C, 0x00
+                };
+                send(client_fd, rep, 7, 0);
+            } else if (cmd_type == 0x01) {
+                /* Generic system reply */
+                unsigned char rep[7] = {
+                    0x05, 0x00,
+                    (unsigned char)(counter & 0xFF), (unsigned char)((counter >> 8) & 0xFF),
+                    0x03, sys_cmd, 0x00
+                };
+                send(client_fd, rep, 7, 0);
+            }
+        } else {
+            /* Direct Command */
+            if (pkt_len < 5) continue;
+            int num_globals = buf[5] | ((buf[6] & 0x03) << 8);
+            if (num_globals < 0) num_globals = 0;
+            if (num_globals > 4096) num_globals = 4096;
+            unsigned char globals[4096] = { 0 };
+
+            unsigned char *bc = &buf[7];
+            int bc_len = (2 + pkt_len) - 7;
+            int pc = 0;
+
+            while (pc < bc_len) {
+                unsigned char op = bc[pc++];
+                if (op == 0x0C) {
+                    /* opPROGRAM_INFO: subcode, slot, dest */
+                    int sub = 0, slot = 0, dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &sub, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &slot, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                        pc += cons;
+                        if (is_g && dest >= 0 && dest < (int)sizeof(globals)) {
+                            /* EV3 lms2012 program status: 0x00 = IDLE/NONE, 0x10 = RUNNING, 0x12 = STOPPED */
+                            globals[dest] = is_prg_running ? 0x10 : 0x00;
+                        }
+                    }
+                } else if (op == 0x02) {
+                    /* opPROGRAM_STOP */
+                    int slot = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &slot, &is_g, &cons) == 0) pc += cons;
+                    if (slot > 0) {
+                        is_prg_running = false;
+                        fprintf(stderr, "[EV3 COM] opPROGRAM_STOP (slot %d)\n", slot);
+                        if (sp && sp->lcd_led[0]) {
+                            qemu_set_irq(sp->lcd_led[0], 0);
+                            qemu_set_irq(sp->lcd_led[1], 0);
+                            qemu_set_irq(sp->lcd_led[2], 0);
+                            qemu_set_irq(sp->lcd_led[3], 0);
+                        }
+                    }
+                } else if (op == 0x7F) {
+                    /* opMEMORY_READ: prgid, objid, offset, size, dest */
+                    int prgid = 0, objid = 0, offset = 0, size = 0, dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &prgid, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &objid, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &offset, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &size, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                        pc += cons;
+                        if (is_g && dest >= 0 && dest < (int)sizeof(globals)) {
+                            int clear_sz = (size > 0 && dest + size <= (int)sizeof(globals)) ? size : 1;
+                            memset(&globals[dest], 0, clear_sz);
+                        }
+                    }
+                } else if (op == 0x0A) {
+                    /* opOBJECT_END */
+                    /* No arguments */
+                } else if (op == 0x81) {
+                    /* opUI_READ */
+                    int sub = 0, len = 0, dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &sub, &is_g, &cons) < 0) break;
+                    pc += cons;
+
+                    switch (sub) {
+                    case 0x01: /* GET_VBATT: float voltage */
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (is_g && dest >= 0 && dest + 4 <= (int)sizeof(globals)) {
+                                float v = 8.0f;
+                                memcpy(&globals[dest], &v, 4);
+                            }
+                        }
+                        break;
+                    case 0x02: /* GET_IBATT: float current */
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (is_g && dest >= 0 && dest + 4 <= (int)sizeof(globals)) {
+                                float i = 0.15f;
+                                memcpy(&globals[dest], &i, 4);
+                            }
+                        }
+                        break;
+                    case 0x03: /* GET_OS_VERS */
+                    case 0x09: /* GET_HW_VERS */
+                    case 0x0A: /* GET_FW_VERS */
+                    case 0x0B: /* GET_FW_BUILD */
+                    case 0x0C: /* GET_OS_BUILD */
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &len, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                                pc += cons;
+                                if (is_g && dest >= 0 && dest < (int)sizeof(globals)) {
+                                    const char *str = "V1.09E";
+                                    if (sub == 0x09) str = "V0.60";
+                                    else if (sub == 0x03 || sub == 0x0C) str = "2.6.33-rc4";
+                                    int max_copy = (len > 0 && len < 64) ? len : 32;
+                                    if (dest + max_copy > (int)sizeof(globals)) {
+                                        max_copy = sizeof(globals) - dest;
+                                    }
+                                    snprintf((char *)&globals[dest], max_copy, "%s", str);
+                                }
+                            }
+                        }
+                        break;
+                    case 0x12: /* GET_LBATT: Data8 battery percent */
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (is_g && dest >= 0 && dest < (int)sizeof(globals)) {
+                                globals[dest] = 100;
+                            }
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+                } else if (op == 0xD3) {
+                    /* opCOM_GET */
+                    int sub = 0, len = 0, dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &sub, &is_g, &cons) < 0) break;
+                    pc += cons;
+                    if (sub == 0x0D) {
+                        /* GET_BRICKNAME */
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &len, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                                pc += cons;
+                                if (is_g && dest >= 0 && dest < (int)sizeof(globals)) {
+                                    int max_copy = (len > 0 && len < 32) ? len : 16;
+                                    if (dest + max_copy > (int)sizeof(globals)) {
+                                        max_copy = sizeof(globals) - dest;
+                                    }
+                                    snprintf((char *)&globals[dest], max_copy, "EV3");
+                                }
+                            }
+                        }
+                    }
+                } else if (op == 0xC5) {
+                    /* opMEMORY_USAGE: TOTAL, FREE */
+                    int dest_total = 0, dest_free = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &dest_total, &is_g, &cons) == 0) {
+                        pc += cons;
+                        if (is_g && dest_total >= 0 && dest_total + 4 <= (int)sizeof(globals)) {
+                            uint32_t total = 16384;
+                            memcpy(&globals[dest_total], &total, 4);
+                        }
+                    }
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &dest_free, &is_g, &cons) == 0) {
+                        pc += cons;
+                        if (is_g && dest_free >= 0 && dest_free + 4 <= (int)sizeof(globals)) {
+                            uint32_t free_mem = 12288;
+                            memcpy(&globals[dest_free], &free_mem, 4);
+                        }
+                    }
+                } else if (op == 0x99) {
+                    /* opINPUT_DEVICE */
+                    int sub = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &sub, &is_g, &cons) < 0) break;
+                    pc += cons;
+                    if (sub == 0x05) {
+                        /* GET_TYPEMODE: LAYER, NO, TYPE_DEST, MODE_DEST */
+                        int layer = 0, no = 0, type_dest = 0, mode_dest = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &type_dest, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (is_g && type_dest >= 0 && type_dest < (int)sizeof(globals)) globals[type_dest] = 0;
+                        }
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &mode_dest, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (is_g && mode_dest >= 0 && mode_dest < (int)sizeof(globals)) globals[mode_dest] = 0;
+                        }
+                    } else if (sub == 0x15) {
+                        /* GET_NAME: LAYER, NO, LENGTH, DEST */
+                        int layer = 0, no = 0, len = 0, dest = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &len, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (is_g && dest >= 0 && dest < (int)sizeof(globals)) globals[dest] = 0;
+                        }
+                    } else if (sub == 0x1D || sub == 0x1E || sub == 0x1F) {
+                        /* READY_SI / READY_RAW / READY_PCT: LAYER, NO, TYPE, MODE, VALUES, DEST */
+                        int layer = 0, no = 0, type = 0, mode = 0, values = 0, dest = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &type, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &mode, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &values, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                            pc += cons;
+                            if (is_g && dest >= 0 && dest + 4 <= (int)sizeof(globals)) {
+                                memset(&globals[dest], 0, 4);
+                            }
+                        }
+                    } else if (sub == 0x1C || sub == 0x1A) {
+                        /* GET_FIGURES / GET_MINMAX: LAYER, NO, DEST1, DEST2 */
+                        int layer = 0, no = 0, d1 = 0, d2 = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &d1, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &d2, &is_g, &cons) == 0) pc += cons;
+                    } else if (sub == 0x16 || sub == 0x17 || sub == 0x1B) {
+                        /* GET_RAW / GET_CONNECTION / GET_CHANGES: LAYER, NO, DEST */
+                        int layer = 0, no = 0, d = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &d, &is_g, &cons) == 0) pc += cons;
+                    } else if (sub == 0x07) {
+                        /* GET_SYMBOL: LAYER, NO, LEN, DEST */
+                        int layer = 0, no = 0, len = 0, d = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &len, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &d, &is_g, &cons) == 0) pc += cons;
+                    } else if (sub == 0x0E) {
+                        /* CLR_ALL: LAYER */
+                        int layer = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                    } else if (sub == 0x0F || sub == 0x11 || sub == 0x18) {
+                        /* CLR_CHANGES / GET_BUMPMIN / STOP: LAYER, NO */
+                        int layer = 0, no = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                    }
+                } else if (op == 0xA0) {
+                    /* opOUTPUT_GET_TYPE: LAYER, NO, TYPE_DEST */
+                    int layer = 0, no = 0, type_dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &type_dest, &is_g, &cons) == 0) {
+                        pc += cons;
+                        if (is_g && type_dest >= 0 && type_dest < (int)sizeof(globals)) globals[type_dest] = 0;
+                    }
+                } else if (op == 0xA8) {
+                    /* opOUTPUT_READ: LAYER, NO, SPEED_DEST, COUNT_DEST */
+                    int layer = 0, no = 0, s_dest = 0, c_dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &s_dest, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &c_dest, &is_g, &cons) == 0) pc += cons;
+                } else if (op == 0xA9) {
+                    /* opOUTPUT_TEST: LAYER, NO, BUSY_DEST */
+                    int layer = 0, no = 0, b_dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &b_dest, &is_g, &cons) == 0) pc += cons;
+                } else if (op == 0xAA) {
+                    /* opOUTPUT_READY: LAYER, NO */
+                    int layer = 0, no = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                } else if (op == 0xB2) {
+                    /* opOUTPUT_GET_COUNT: LAYER, NO, COUNT_DEST */
+                    int layer = 0, no = 0, c_dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &c_dest, &is_g, &cons) == 0) pc += cons;
+                } else if (op == 0xB3) {
+                    /* opOUTPUT_PRG_STOP: LAYER */
+                    int layer = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                } else if (op == 0x94 && pc < bc_len && bc[pc] == 0x01) {
+                    /* opSOUND TONE: [0x94, 0x01, 0x81, vol, 0x82, freq_lo, freq_hi, 0x82, dur_lo, dur_hi] */
+                    pc++;
+                    int vol = 0, freq = 0, dur = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &vol, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &freq, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &dur, &is_g, &cons) == 0) pc += cons;
+
+                    sp->sound.freq_hz = freq ? freq : 1000;
+                    sp->sound.volume = vol ? vol : 50;
+                    sp->sound.enabled = true;
+
+                    ToneStopArg *stop_arg = g_new0(ToneStopArg, 1);
+                    stop_arg->sp = sp;
+                    stop_arg->dur_ms = dur ? dur : 300;
+                    QemuThread th;
+                    qemu_thread_create(&th, "ev3-tone-stop", ev3_tone_stop_worker, stop_arg, QEMU_THREAD_DETACHED);
+                } else if (op == 0x82 && pc < bc_len && bc[pc] == 0x1B) {
+                    /* opUI_WRITE LED: pattern */
+                    pc++;
+                    int pat = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &pat, &is_g, &cons) == 0) pc += cons;
+                    bool rl = false, gl = false, rr = false, gr = false;
+                    switch (pat) {
+                    case 1: gl = gr = true; break; /* green */
+                    case 2: rl = rr = true; break; /* red */
+                    case 3: rl = gl = rr = gr = true; break; /* orange */
+                    case 4: gl = gr = true; break; /* flash green */
+                    case 5: rl = rr = true; break; /* flash red */
+                    case 6: rl = gl = rr = gr = true; break; /* flash orange */
+                    case 7: gl = gr = true; break; /* pulse green */
+                    case 8: rl = rr = true; break; /* pulse red */
+                    case 9: rl = gl = rr = gr = true; break; /* pulse orange */
+                    default: break; /* off */
+                    }
+                    if (sp->lcd_led[0]) {
+                        qemu_set_irq(sp->lcd_led[0], rl);
+                        qemu_set_irq(sp->lcd_led[1], gl);
+                        qemu_set_irq(sp->lcd_led[2], rr);
+                        qemu_set_irq(sp->lcd_led[3], gr);
+                    }
+                } else if (op == 0xC0) {
+                    /* opFILE */
+                    int sub = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &sub, &is_g, &cons) == 0) pc += cons;
+
+                    if (sub == 0x08) {
+                        /* LOAD_IMAGE: slot, name, size_dest, ip_dest */
+                        int slot = 0;
+                        const char *path = "";
+                        int size_dest = 0, ip_dest = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &slot, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_str(&bc[pc], bc_len - pc, &path, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &size_dest, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &ip_dest, &is_g, &cons) == 0) pc += cons;
+
+                        fprintf(stderr, "[EV3 COM] opFILE LOAD_IMAGE: slot=%d path='%s' size_dest=%d ip_dest=%d\n",
+                                slot, path ? path : "", size_dest, ip_dest);
+
+                        uint32_t file_sz = 1024;
+                        char safe_path[512];
+                        ev3_resolve_path(path, safe_path, sizeof(safe_path));
+                        struct stat st;
+                        if (stat(safe_path, &st) == 0 && st.st_size > 0) {
+                            file_sz = st.st_size;
+                        }
+
+                        if (size_dest >= 0 && size_dest + 4 <= (int)sizeof(globals)) {
+                            memcpy(&globals[size_dest], &file_sz, 4);
+                        }
+                        if (ip_dest >= 0 && ip_dest + 4 <= (int)sizeof(globals)) {
+                            uint32_t fake_ip = 0x00010000; /* non-zero valid pointer so deployment succeeds */
+                            memcpy(&globals[ip_dest], &fake_ip, 4);
+                        }
+
+                        /* Ensure file is synced to guest */
+                        FILE *fp = fopen(safe_path, "rb");
+                        if (fp) {
+                            fseek(fp, 0, SEEK_END);
+                            long fsz = ftell(fp);
+                            fseek(fp, 0, SEEK_SET);
+                            void *fdata = malloc(fsz);
+                            if (fdata) {
+                                if (fread(fdata, 1, fsz, fp) == (size_t)fsz) {
+                                    ev3_sync_to_guest('F', ev3_clean_relpath(path), fdata, fsz);
+                                }
+                                free(fdata);
+                            }
+                            fclose(fp);
+                        }
+                    } else if (sub == 0x09 || sub == 0x0C) {
+                        /* GET_IMAGE: slot, ip_dest */
+                        int slot = 0, ip_dest = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &slot, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &ip_dest, &is_g, &cons) == 0) pc += cons;
+                        if (ip_dest >= 0 && ip_dest + 4 <= (int)sizeof(globals)) {
+                            uint32_t fake_ip = 0x00010000;
+                            memcpy(&globals[ip_dest], &fake_ip, 4);
+                        }
+                    } else if (sub == 0x0A) {
+                        /* GET_ITEM: slot, item, val_dest */
+                        int slot = 0, item = 0, val_dest = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &slot, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &item, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &val_dest, &is_g, &cons) == 0) pc += cons;
+                        if (val_dest >= 0 && val_dest + 4 <= (int)sizeof(globals)) {
+                            uint32_t val = 0;
+                            memcpy(&globals[val_dest], &val, 4);
+                        }
+                    } else if (sub == 0x0D) {
+                        /* GET_CACHE_FILE: name, size_dest, ip_dest */
+                        const char *path = "";
+                        int size_dest = 0, ip_dest = 0;
+                        if (ev3_decode_str(&bc[pc], bc_len - pc, &path, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &size_dest, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &ip_dest, &is_g, &cons) == 0) pc += cons;
+                        if (size_dest >= 0 && size_dest + 4 <= (int)sizeof(globals)) {
+                            uint32_t z = 0;
+                            memcpy(&globals[size_dest], &z, 4);
+                        }
+                        if (ip_dest >= 0 && ip_dest + 4 <= (int)sizeof(globals)) {
+                            uint32_t z = 0;
+                            memcpy(&globals[ip_dest], &z, 4);
+                        }
+                    } else if (sub == 0x1E) {
+                        /* REMOVE_SUBFOLDERS: name */
+                        const char *path = "";
+                        if (ev3_decode_str(&bc[pc], bc_len - pc, &path, &cons) == 0) pc += cons;
+                    } else {
+                        fprintf(stderr, "[EV3 COM] opFILE: unhandled subcode 0x%02X\n", sub);
+                    }
+                } else if (op == 0x03) {
+                    /* opPROGRAM_START: slot, size, ip, debug */
+                    int slot = 0, size = 0, ip = 0, debug = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &slot, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &size, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &ip, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &debug, &is_g, &cons) == 0) pc += cons;
+
+                    if (slot == 1) {
+                        is_prg_running = true;
+                        fprintf(stderr, "[EV3 COM] opPROGRAM_START: user program slot=%d size=%d ip=%d debug=%d\n",
+                                slot, size, ip, debug);
+
+                        /* Play start sound & green LED on brick */
+                        if (sp) {
+                            sp->sound.freq_hz = 1500;
+                            sp->sound.volume = 60;
+                            sp->sound.enabled = true;
+                            ToneStopArg *stop_arg = g_new0(ToneStopArg, 1);
+                            stop_arg->sp = sp;
+                            stop_arg->dur_ms = 250;
+                            QemuThread th;
+                            qemu_thread_create(&th, "ev3-tone-stop", ev3_tone_stop_worker, stop_arg, QEMU_THREAD_DETACHED);
+                            if (sp->lcd_led[0]) {
+                                qemu_set_irq(sp->lcd_led[1], 1);
+                                qemu_set_irq(sp->lcd_led[3], 1);
+                            }
+                        }
+                    }
+                } else {
+                    /* Skip unknown opcode */
+                    pc++;
+                }
+            }
+
+            /* Reply if requested (Type 0x00) */
+            if (cmd_type == 0x00) {
+                int rep_globals = num_globals;
+                if (rep_globals == 0 && globals[4] != 0) {
+                    rep_globals = 8;
+                }
+                int rep_len = 3 + rep_globals;
+                unsigned char *rep = g_malloc0(2 + rep_len);
+                rep[0] = rep_len & 0xFF;
+                rep[1] = (rep_len >> 8) & 0xFF;
+                rep[2] = (unsigned char)(counter & 0xFF);
+                rep[3] = (unsigned char)((counter >> 8) & 0xFF);
+                rep[4] = 0x02; /* DIRECT_REPLY */
+                if (rep_globals > 0) {
+                    memcpy(&rep[5], globals, rep_globals);
+                }
+                send(client_fd, rep, 2 + rep_len, 0);
+                fprintf(stderr, "[EV3 COM] Sent Direct Reply (%d bytes, globals=%d)\n", 2 + rep_len, rep_globals);
+                g_free(rep);
+            }
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        if (file_handles[i] > 0) close(file_handles[i]);
+    }
+    close(client_fd);
+}
+
+static void *ev3_tcp_server_worker(void *opaque)
+{
+    EV3ComServer *srv = opaque;
+    fprintf(stderr, "[EV3 COM] TCP server worker thread started...\n");
+    int server_fd = -1;
+
+    while (1) {
+        server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            g_usleep(250000);
+            continue;
+        }
+
+        int opt = 1;
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+        struct sockaddr_in serv_addr;
+        memset(&serv_addr, 0, sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_addr.s_addr = INADDR_ANY;
+        serv_addr.sin_port = htons(EV3_TCP_PORT);
+
+        if (bind(server_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
+            break;
+        }
+        fprintf(stderr, "[EV3 COM] TCP bind failed: %s (errno=%d)\n", strerror(errno), errno);
+        close(server_fd);
+        g_usleep(500000);
+    }
+
+    listen(server_fd, 5);
+    fprintf(stderr, "[EV3 COM] TCP Server listening on port %d\n", EV3_TCP_PORT);
+
+    while (1) {
+        struct sockaddr_in cli_addr;
+        socklen_t clilen = sizeof(cli_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&cli_addr, &clilen);
+        if (client_fd < 0) continue;
+
+        ev3_handle_client(srv->sp, client_fd);
+    }
+    close(server_fd);
+    return NULL;
+}
+
+static void ev3_com_init(DA850SimplePeripherals *sp)
+{
+    EV3ComServer *srv = g_new0(EV3ComServer, 1);
+    srv->sp = sp;
+
+    qemu_thread_create(&srv->discovery_thread, "ev3-discovery",
+                       ev3_discovery_worker, srv, QEMU_THREAD_DETACHED);
+    qemu_thread_create(&srv->tcp_thread, "ev3-tcp-srv",
+                       ev3_tcp_server_worker, srv, QEMU_THREAD_DETACHED);
 }
 
 /*
@@ -781,6 +2103,7 @@ static void versatile_init(MachineState *machine, int board_id)
     /* ??? RAM should repeat to fill physical memory space.  */
     /* SDRAM at address zero.  */
     memory_region_add_subregion(sysmem, 0xc0000000, machine->ram);
+    ev3_ram_mr = machine->ram;
 
 #if 0
     sysctl = qdev_new("realview_sysctl");
@@ -865,7 +2188,12 @@ sysbus_connect_irq(aintc_bus, 0, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
     /* DA850 console is UART1, which Linux exposes as ttyS1 here. */
     serial_mm_init(get_system_memory(), 0x01c42000, 2, qdev_get_gpio_in(aintc, 25), 115200, serial_hd(0), DEVICE_LITTLE_ENDIAN);
     serial_mm_init(get_system_memory(), 0x01d0c000, 2, qdev_get_gpio_in(aintc, 53), 115200, serial_hd(1), DEVICE_LITTLE_ENDIAN);
-    serial_mm_init(get_system_memory(), 0x01d0d000, 2, qdev_get_gpio_in(aintc, 61), 115200, serial_hd(2), DEVICE_LITTLE_ENDIAN);
+    Chardev *chr2 = serial_hd(2);
+    if (!chr2) {
+        unlink("/tmp/ev3_guest_bridge.sock");
+        chr2 = qemu_chr_new("ev3_guest_bridge", "unix:/tmp/ev3_guest_bridge.sock,server=on,wait=off", NULL);
+    }
+    serial_mm_init(get_system_memory(), 0x01d0d000, 2, qdev_get_gpio_in(aintc, 61), 115200, chr2, DEVICE_LITTLE_ENDIAN);
 
     /* vpb_init の中に追加 */
     MemoryRegion *syscfg0 = g_new(MemoryRegion, 1);
@@ -906,6 +2234,7 @@ sysbus_connect_irq(aintc_bus, 0, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
                                 &simple_peripherals->ecap1_mmio);
 
     ev3_sound_init(&simple_peripherals->sound);
+    ev3_com_init(simple_peripherals);
 /*
         MemoryRegion *psc0 = g_new(MemoryRegion, 1);
     memory_region_init_io(psc0, NULL, &da850_psc_ops, NULL, "da850.psc0", 0x1000);
@@ -1095,6 +2424,26 @@ sysbus_connect_irq(SYS_BUS_DEVICE(spi0), 0, qdev_get_gpio_in(aintc, 56)); /* IRQ
 DeviceState *flash = qdev_new("s25sl12801");
 SSIBus *spi0_bus = (SSIBus *)qdev_get_child_bus(spi0, "spi");
 qdev_realize_and_unref(flash, BUS(spi0_bus), &error_fatal);
+
+uint8_t *fstorage = m25p80_get_storage(flash);
+if (fstorage) {
+    const uint32_t storage_offset = 0x00cb0000;
+    const uint32_t max_size = 0x00350000;
+    FILE *fp = fopen("/tmp/ev3_data.tgz", "rb");
+    if (!fp) {
+        fp = fopen("/tmp/orig_fs/etc/def_sett.tgz", "rb");
+    }
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long sz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        if (sz > 0 && sz <= max_size) {
+            size_t rd = fread(fstorage + storage_offset, 1, sz, fp);
+            fprintf(stderr, "[EV3 FLASH] Loaded %zu bytes into MTD4 storage (offset 0x%08x)\n", rd, storage_offset);
+        }
+        fclose(fp);
+    }
+}
 
 qemu_irq cs_line0 = qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0);
 sysbus_connect_irq(SYS_BUS_DEVICE(spi0), 1, cs_line0);

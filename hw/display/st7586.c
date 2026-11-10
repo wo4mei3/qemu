@@ -207,6 +207,7 @@ static void st7586_input_event(DeviceState *dev, QemuConsole *src,
         } else {
             s->key_buttons &= ~(1u << btn);
         }
+        fprintf(stderr, "ST7586 BUTTON: btn=%d down=%d active=0x%x\n", btn, key->down, s->key_buttons);
         st7586_sync_buttons(s);
         break;
     }

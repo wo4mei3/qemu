@@ -65,6 +65,9 @@ uint32_t nand_getbuswidth(DeviceState *dev);
 /* onenand.c */
 void *onenand_raw_otp(DeviceState *onenand_device);
 
+/* m25p80.c */
+uint8_t *m25p80_get_storage(DeviceState *d);
+
 /* ecc.c */
 typedef struct {
     uint8_t cp;		/* Column parity */
