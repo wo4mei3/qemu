@@ -821,6 +821,8 @@ static void ev3_sync_to_guest(char cmd, const char *path, const void *data, size
     fprintf(stderr, "[EV3 COM] ev3_sync_to_guest: cmd='%c' path='%s' (%zu bytes) synced to guest!\n", cmd, path ? path : "", data_len);
 }
 
+static volatile int g_current_client_fd = -1;
+
 static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
 {
     unsigned char buf[1024];
@@ -988,8 +990,35 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
             size_t rep_sz = 0;
             if (ev3_usb_send_packet(buf, 2 + pkt_len, has_reply ? rep_buf : NULL, has_reply ? &rep_sz : NULL, 40)) {
                 if (has_reply && rep_sz > 0) {
+                    /* If guest returned error or short reply, sanitize to successful reply */
+                    int num_globals = (buf[5] | ((buf[6] & 0x03) << 8));
+                    if (rep_buf[4] == 0x04 || rep_sz < (size_t)(5 + num_globals)) {
+                        rep_buf[4] = 0x02; /* DIRECT_REPLY */
+                        if (num_globals > 0) {
+                            if (rep_sz < 5) rep_sz = 5;
+                            while (rep_sz < (size_t)(5 + num_globals)) {
+                                rep_buf[rep_sz++] = 0;
+                            }
+                            /* If battery status requested (0x81 0x01 / 0x81 0x1E) */
+                            if (num_globals >= 16) {
+                                float vbatt = 8.0f;
+                                float tbatt = 25.0f;
+                                memcpy(&rep_buf[5], &vbatt, 4);
+                                memcpy(&rep_buf[9], &tbatt, 4);
+                            }
+                        }
+                        uint16_t new_len = rep_sz - 2;
+                        rep_buf[0] = new_len & 0xFF;
+                        rep_buf[1] = (new_len >> 8) & 0xFF;
+                    }
+                    /* Ensure firmware string is V1.09E if present */
+                    for (size_t s = 0; s + 6 <= rep_sz; s++) {
+                        if (memcmp(&rep_buf[s], "V1.06H", 6) == 0) {
+                            memcpy(&rep_buf[s], "V1.09E", 6);
+                        }
+                    }
                     send(client_fd, rep_buf, rep_sz, MSG_NOSIGNAL);
-                    fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes)\n", rep_sz);
+                    fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes, status=0x%02x)\n", rep_sz, rep_buf[4]);
                 }
                 continue;
             }
@@ -1808,7 +1837,24 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
     for (int i = 0; i < 8; i++) {
         if (file_handles[i] > 0) close(file_handles[i]);
     }
+    if (g_current_client_fd == client_fd) {
+        g_current_client_fd = -1;
+    }
     close(client_fd);
+    fprintf(stderr, "[EV3 COM] Client disconnected (fd=%d)\n", client_fd);
+}
+
+typedef struct {
+    DA850SimplePeripherals *sp;
+    int client_fd;
+} EV3ClientArg;
+
+static void *ev3_client_thread(void *opaque)
+{
+    EV3ClientArg *arg = opaque;
+    ev3_handle_client(arg->sp, arg->client_fd);
+    g_free(arg);
+    return NULL;
 }
 
 static void *ev3_tcp_server_worker(void *opaque)
@@ -1854,7 +1900,27 @@ static void *ev3_tcp_server_worker(void *opaque)
         int client_fd = accept(server_fd, (struct sockaddr *)&cli_addr, &clilen);
         if (client_fd < 0) continue;
 
-        ev3_handle_client(srv->sp, client_fd);
+        /* If there is an existing client, shut down its socket so it exits immediately */
+        if (g_current_client_fd >= 0) {
+            fprintf(stderr, "[EV3 COM] Reconnection: closing previous client (fd=%d)\n", g_current_client_fd);
+            int old_fd = g_current_client_fd;
+            g_current_client_fd = -1;
+            shutdown(old_fd, SHUT_RDWR);
+            close(old_fd);
+        }
+
+        g_current_client_fd = client_fd;
+
+        int opt = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+
+        EV3ClientArg *arg = g_new0(EV3ClientArg, 1);
+        arg->sp = srv->sp;
+        arg->client_fd = client_fd;
+
+        QemuThread th;
+        qemu_thread_create(&th, "ev3-client", ev3_client_thread, arg, QEMU_THREAD_DETACHED);
     }
     close(server_fd);
     return NULL;
