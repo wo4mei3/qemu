@@ -1018,7 +1018,11 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                         }
                     }
                     send(client_fd, rep_buf, rep_sz, MSG_NOSIGNAL);
-                    fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes, status=0x%02x)\n", rep_sz, rep_buf[4]);
+                    fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes, status=0x%02x): ", rep_sz, rep_buf[4]);
+                    for (size_t ri = 0; ri < rep_sz; ri++) {
+                        fprintf(stderr, "%02x ", rep_buf[ri]);
+                    }
+                    fprintf(stderr, "\n");
                 }
                 continue;
             }
