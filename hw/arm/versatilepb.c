@@ -644,6 +644,28 @@ static void ev3_restore_file_to_guest(const char *host_path, const char *rel_pat
     fclose(fp);
     if (sent == fsz) {
         fprintf(stderr, "[EV3 STORAGE] Restored %s (%ld bytes) to EV3 guest!\n", ev3_path, fsz);
+        /* Also register .rbf files into Tab 1 ("Run Recent") via opFILE PUT_CACHE_FILE (0xC0 0x15) */
+        size_t rlen = strlen(rel_path);
+        if (rlen >= 4 && strcasecmp(rel_path + rlen - 4, ".rbf") == 0 && 11 + path_len <= sizeof(pkt)) {
+            cnt = (*seq)++;
+            uint16_t cache_len = 9 + path_len;
+            pkt[0] = cache_len & 0xFF;
+            pkt[1] = (cache_len >> 8) & 0xFF;
+            pkt[2] = cnt & 0xFF;
+            pkt[3] = (cnt >> 8) & 0xFF;
+            pkt[4] = 0x00; /* DIRECT_COMMAND_REPLY */
+            pkt[5] = 0x00;
+            pkt[6] = 0x00;
+            pkt[7] = 0xC0; /* opFILE */
+            pkt[8] = 0x15; /* PUT_CACHE_FILE */
+            pkt[9] = 0x84; /* LCS string */
+            memcpy(&pkt[10], ev3_path, path_len);
+            pkt[10 + path_len] = 0x0A; /* opOBJECT_END */
+            rep_sz = 0;
+            if (ev3_usb_send_packet(pkt, 2 + cache_len, rep, &rep_sz, 500)) {
+                fprintf(stderr, "[EV3 STORAGE] Registered %s in Run Recent (Tab 1)!\n", ev3_path);
+            }
+        }
     }
 }
 
