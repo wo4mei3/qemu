@@ -510,6 +510,179 @@ static bool ev3_usb_send_packet(const uint8_t *pkt, size_t len,
 }
 
 static volatile int g_current_client_fd = -1;
+static uint8_t *g_ev3_flash_storage = NULL;
+
+static void ev3_get_mtd4_path(char *out, size_t out_sz)
+{
+    const char *home = getenv("HOME");
+    if (home && home[0] != '\0') {
+        snprintf(out, out_sz, "%s/.ev3_mtd4.bin", home);
+    } else {
+        snprintf(out, out_sz, "/tmp/ev3_mtd4.bin");
+    }
+}
+
+static void ev3_save_mtd4_on_exit(void)
+{
+    if (!g_ev3_flash_storage) {
+        return;
+    }
+    const uint32_t storage_offset = 0x00cb0000;
+    const uint32_t max_size = 0x00350000;
+    const uint8_t *src = g_ev3_flash_storage + storage_offset;
+
+    /* Check if MTD4 has any non-0xFF data written */
+    bool has_data = false;
+    for (uint32_t i = 0; i < max_size; i++) {
+        if (src[i] != 0xFF) {
+            has_data = true;
+            break;
+        }
+    }
+    if (!has_data) {
+        return;
+    }
+
+    char path[512], tmp_path[528];
+    ev3_get_mtd4_path(path, sizeof(path));
+    snprintf(tmp_path, sizeof(tmp_path), "%.500s.tmp", path);
+
+    FILE *fp = fopen(tmp_path, "wb");
+    if (fp) {
+        size_t wr = fwrite(src, 1, max_size, fp);
+        fclose(fp);
+        if (wr == max_size) {
+            rename(tmp_path, path);
+            fprintf(stderr, "[EV3 FLASH] Saved MTD4 storage (%u bytes) to %s\n", max_size, path);
+        } else {
+            unlink(tmp_path);
+        }
+    }
+}
+
+static void ev3_get_prjs_root(char *out, size_t out_sz)
+{
+    const char *home = getenv("HOME");
+    if (home && home[0] != '\0') {
+        snprintf(out, out_sz, "%s/.ev3_prjs", home);
+    } else {
+        snprintf(out, out_sz, "/tmp/ev3_prjs");
+    }
+    mkdir(out, 0755);
+    char brkprog[600];
+    snprintf(brkprog, sizeof(brkprog), "%s/BrkProg_SAVE", out);
+    mkdir(brkprog, 0755);
+}
+
+static void ev3_restore_file_to_guest(const char *host_path, const char *rel_path, uint16_t *seq)
+{
+    FILE *fp = fopen(host_path, "rb");
+    if (!fp) return;
+    fseek(fp, 0, SEEK_END);
+    long fsz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsz <= 0 || fsz > 10 * 1024 * 1024) {
+        fclose(fp);
+        return;
+    }
+
+    char ev3_path[512];
+    snprintf(ev3_path, sizeof(ev3_path), "../prjs/%.480s", rel_path);
+    size_t path_len = strlen(ev3_path) + 1; /* include NUL */
+
+    unsigned char pkt[1024];
+    uint16_t cnt = (*seq)++;
+    uint16_t begin_len = 8 + path_len;
+    if (2 + begin_len > sizeof(pkt)) {
+        fclose(fp);
+        return;
+    }
+    pkt[0] = begin_len & 0xFF;
+    pkt[1] = (begin_len >> 8) & 0xFF;
+    pkt[2] = cnt & 0xFF;
+    pkt[3] = (cnt >> 8) & 0xFF;
+    pkt[4] = 0x01; /* SYSTEM_COMMAND_REPLY */
+    pkt[5] = 0x92; /* BEGIN_DOWNLOAD */
+    pkt[6] = (unsigned char)(fsz & 0xFF);
+    pkt[7] = (unsigned char)((fsz >> 8) & 0xFF);
+    pkt[8] = (unsigned char)((fsz >> 16) & 0xFF);
+    pkt[9] = (unsigned char)((fsz >> 24) & 0xFF);
+    memcpy(&pkt[10], ev3_path, path_len);
+
+    uint8_t rep[256];
+    size_t rep_sz = 0;
+    if (!ev3_usb_send_packet(pkt, 2 + begin_len, rep, &rep_sz, 1000) || rep_sz < 8 || rep[6] != 0x00) {
+        fprintf(stderr, "[EV3 STORAGE] Failed to BEGIN_DOWNLOAD restore for %s (rep_sz=%zu)\n", ev3_path, rep_sz);
+        fclose(fp);
+        return;
+    }
+    unsigned char g_handle = rep[7];
+
+    long sent = 0;
+    while (sent < fsz) {
+        size_t chunk = (size_t)((fsz - sent) > 900 ? 900 : (fsz - sent));
+        if (fread(&pkt[7], 1, chunk, fp) != chunk) {
+            break;
+        }
+        cnt = (*seq)++;
+        uint16_t cont_len = 5 + chunk;
+        pkt[0] = cont_len & 0xFF;
+        pkt[1] = (cont_len >> 8) & 0xFF;
+        pkt[2] = cnt & 0xFF;
+        pkt[3] = (cnt >> 8) & 0xFF;
+        pkt[4] = 0x01; /* SYSTEM_COMMAND_REPLY */
+        pkt[5] = 0x93; /* CONTINUE_DOWNLOAD */
+        pkt[6] = g_handle;
+
+        rep_sz = 0;
+        if (!ev3_usb_send_packet(pkt, 2 + cont_len, rep, &rep_sz, 1000)) {
+            fprintf(stderr, "[EV3 STORAGE] Failed to CONTINUE_DOWNLOAD restore for %s\n", ev3_path);
+            break;
+        }
+        sent += chunk;
+    }
+    fclose(fp);
+    if (sent == fsz) {
+        fprintf(stderr, "[EV3 STORAGE] Restored %s (%ld bytes) to EV3 guest!\n", ev3_path, fsz);
+    }
+}
+
+static void ev3_restore_dir_recursive(const char *host_dir, const char *rel_prefix, uint16_t *seq)
+{
+    DIR *dir = opendir(host_dir);
+    if (!dir) return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s/%s", host_dir, ent->d_name);
+        char rel_path[1024];
+        if (rel_prefix && rel_prefix[0] != '\0') {
+            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, ent->d_name);
+        } else {
+            snprintf(rel_path, sizeof(rel_path), "%s", ent->d_name);
+        }
+        struct stat st;
+        if (stat(full_path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            ev3_restore_dir_recursive(full_path, rel_path, seq);
+        } else if (S_ISREG(st.st_mode) && st.st_size > 0) {
+            ev3_restore_file_to_guest(full_path, rel_path, seq);
+        }
+    }
+    closedir(dir);
+}
+
+static void ev3_restore_prjs_to_guest(void)
+{
+    char root[512];
+    ev3_get_prjs_root(root, sizeof(root));
+    /* Wait briefly for lms2012 c_com loop to finish initializing */
+    g_usleep(1000000);
+    uint16_t seq = 0x9000;
+    fprintf(stderr, "[EV3 STORAGE] Restoring saved programs from %s to EV3 guest...\n", root);
+    ev3_restore_dir_recursive(root, "", &seq);
+}
 
 static void *ev3_discovery_worker(void *opaque)
 {
@@ -545,7 +718,9 @@ static void *ev3_discovery_worker(void *opaque)
     while (!ev3_get_usb_bss()) {
         g_usleep(500000);
     }
-    fprintf(stderr, "[EV3 COM] LMS2012 ready, starting UDP broadcast...\n");
+    fprintf(stderr, "[EV3 COM] LMS2012 ready, restoring saved programs...\n");
+    ev3_restore_prjs_to_guest();
+    fprintf(stderr, "[EV3 COM] Starting UDP broadcast...\n");
 
     const char *payload = 
         "Serial-Number: " EV3_SERIAL_NUM "\r\n"
@@ -794,15 +969,15 @@ static const char *ev3_clean_relpath(const char *path)
 
 static void ev3_resolve_path(const char *ev3_path, char *out, size_t out_sz)
 {
-    mkdir("/tmp/ev3_prjs", 0755);
-    mkdir("/tmp/ev3_prjs/BrkProg_SAVE", 0755);
+    char root[256];
+    ev3_get_prjs_root(root, sizeof(root));
 
     const char *p = ev3_clean_relpath(ev3_path);
 
     if (*p == '\0') {
-        snprintf(out, out_sz, "/tmp/ev3_prjs");
+        snprintf(out, out_sz, "%s", root);
     } else {
-        snprintf(out, out_sz, "/tmp/ev3_prjs/%s", p);
+        snprintf(out, out_sz, "%.240s/%.240s", root, p);
         size_t len = strlen(out);
         if (len > 0 && out[len - 1] == '/') {
             out[len - 1] = '\0';
@@ -1019,7 +1194,9 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                 closedir(dir);
             }
 
-            if (list_len == 0 && strcmp(target_dir, "/tmp/ev3_prjs") == 0) {
+            char root_dir[512];
+            ev3_get_prjs_root(root_dir, sizeof(root_dir));
+            if (list_len == 0 && strcmp(target_dir, root_dir) == 0) {
                 list_len = snprintf(list_str, sizeof(list_str), "BrkProg_SAVE/\n");
             }
 
@@ -1390,7 +1567,9 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     closedir(dir);
                 }
 
-                if (list_len == 0 && strcmp(target_dir, "/tmp/ev3_prjs") == 0) {
+                char root_dir[512];
+                ev3_get_prjs_root(root_dir, sizeof(root_dir));
+                if (list_len == 0 && strcmp(target_dir, root_dir) == 0) {
                     list_len = snprintf(list_str, sizeof(list_str), "BrkProg_SAVE/\n");
                 }
 
@@ -1432,7 +1611,9 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                 ev3_resolve_path(filename, safe_path, sizeof(safe_path));
                 unlink(safe_path);
                 rmdir(safe_path);
-                ev3_sync_to_guest('R', ev3_clean_relpath(filename), NULL, 0);
+                uint8_t g_rep[256];
+                size_t g_rep_sz = 0;
+                ev3_usb_send_packet(buf, 2 + pkt_len, g_rep, &g_rep_sz, 500);
                 fprintf(stderr, "[EV3 COM] DELETE_FILE: %s -> %s\n", filename, safe_path);
                 unsigned char rep[7] = {
                     0x05, 0x00,
@@ -2896,11 +3077,21 @@ qdev_realize_and_unref(flash, BUS(spi0_bus), &error_fatal);
 
 uint8_t *fstorage = m25p80_get_storage(flash);
 if (fstorage) {
+    g_ev3_flash_storage = fstorage;
+    atexit(ev3_save_mtd4_on_exit);
     const uint32_t storage_offset = 0x00cb0000;
     const uint32_t max_size = 0x00350000;
-    FILE *fp = fopen("/tmp/ev3_data.tgz", "rb");
+    char mtd4_path[512];
+    ev3_get_mtd4_path(mtd4_path, sizeof(mtd4_path));
+    FILE *fp = fopen(mtd4_path, "rb");
+    const char *src_name = mtd4_path;
+    if (!fp) {
+        fp = fopen("/tmp/ev3_data.tgz", "rb");
+        src_name = "/tmp/ev3_data.tgz";
+    }
     if (!fp) {
         fp = fopen("/tmp/orig_fs/etc/def_sett.tgz", "rb");
+        src_name = "/tmp/orig_fs/etc/def_sett.tgz";
     }
     if (fp) {
         fseek(fp, 0, SEEK_END);
@@ -2908,7 +3099,8 @@ if (fstorage) {
         fseek(fp, 0, SEEK_SET);
         if (sz > 0 && sz <= max_size) {
             size_t rd = fread(fstorage + storage_offset, 1, sz, fp);
-            fprintf(stderr, "[EV3 FLASH] Loaded %zu bytes into MTD4 storage (offset 0x%08x)\n", rd, storage_offset);
+            fprintf(stderr, "[EV3 FLASH] Loaded %zu bytes from %s into MTD4 storage (offset 0x%08x)\n",
+                    rd, src_name, storage_offset);
         }
         fclose(fp);
     }
