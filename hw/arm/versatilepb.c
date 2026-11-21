@@ -332,11 +332,20 @@ typedef struct {
     uint32_t dur_ms;
 } ToneStopArg;
 
+static volatile bool g_is_prg_running = false;
+
 static void *ev3_tone_stop_worker(void *opaque)
 {
     ToneStopArg *arg = opaque;
     g_usleep((gulong)arg->dur_ms * 1000);
-    arg->sp->sound.enabled = false;
+    if (arg->sp) {
+        arg->sp->sound.enabled = false;
+        if (arg->sp->lcd_led[0]) {
+            qemu_set_irq(arg->sp->lcd_led[1], 0);
+            qemu_set_irq(arg->sp->lcd_led[3], 0);
+        }
+    }
+    g_is_prg_running = false;
     g_free(arg);
     return NULL;
 }
@@ -451,6 +460,13 @@ static bool ev3_usb_send_packet(const uint8_t *pkt, size_t len,
                 continue;
             }
 
+            /* Discard any stale reply whose sequence counter does not match the request */
+            if (chunk_len >= 4 && len >= 4 && (rep[2] != pkt[2] || rep[3] != pkt[3])) {
+                fprintf(stderr, "[EV3 USB BRIDGE] Discarding stale reply (got cnt=%02x %02x, expected=%02x %02x)\n",
+                        rep[2], rep[3], pkt[2], pkt[3]);
+                continue;
+            }
+
             total_received = chunk_len;
             if (total_received >= 2) {
                 uint16_t expected_total = (rep[0] | (rep[1] << 8)) + 2;
@@ -492,6 +508,8 @@ static bool ev3_usb_send_packet(const uint8_t *pkt, size_t len,
     }
     return true;
 }
+
+static volatile int g_current_client_fd = -1;
 
 static void *ev3_discovery_worker(void *opaque)
 {
@@ -577,6 +595,12 @@ static void *ev3_discovery_worker(void *opaque)
     }
 
     while (1) {
+        if (g_current_client_fd >= 0) {
+            /* Pause UDP 3015 discovery broadcasts while a TCP client is connected (matches real EV3 c_wifi.c) */
+            g_usleep(200000);
+            continue;
+        }
+
         sendto(sock, payload, payload_len, 0, (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
         sendto(sock, payload, payload_len, 0, (struct sockaddr *)&local_addr, sizeof(local_addr));
         if (host_ip[0] != '\0') {
@@ -620,6 +644,9 @@ static void *ev3_discovery_worker(void *opaque)
         }
 
         for (int i = 0; i < 5; i++) {
+            if (g_current_client_fd >= 0) {
+                break;
+            }
             char ack_buf[128];
             struct sockaddr_in client_addr;
             socklen_t addr_len = sizeof(client_addr);
@@ -821,15 +848,14 @@ static void ev3_sync_to_guest(char cmd, const char *path, const void *data, size
     fprintf(stderr, "[EV3 COM] ev3_sync_to_guest: cmd='%c' path='%s' (%zu bytes) synced to guest!\n", cmd, path ? path : "", data_len);
 }
 
-static volatile int g_current_client_fd = -1;
-
 static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
 {
     unsigned char buf[1024];
     int file_handles[8] = { 0 };
+    unsigned char guest_file_handles[8] = { 0 };
     char file_ev3_paths[8][1024] = { { 0 } };
     char file_safe_paths[8][1024] = { { 0 } };
-    bool is_prg_running = false;
+    g_is_prg_running = false;
 
     fprintf(stderr, "[EV3 COM] Client connected on TCP 5555!\n");
 
@@ -842,9 +868,17 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
     while (1) {
         unsigned char hdr[2];
         int n = recv(client_fd, hdr, 2, MSG_WAITALL);
-        if (n != 2) {
-            fprintf(stderr, "[EV3 COM] recv header failed (n=%d)\n", n);
+        if (n <= 0) {
+            fprintf(stderr, "[EV3 COM] recv header failed (n=%d, errno=%d)\n", n, errno);
             break;
+        }
+        if (n == 1) {
+            int n2 = recv(client_fd, &hdr[1], 1, MSG_WAITALL);
+            if (n2 != 1) {
+                fprintf(stderr, "[EV3 COM] Incomplete header read\n");
+                break;
+            }
+            n = 2;
         }
 
         /* Check for official software VMTP1.0 unlock handshake */
@@ -876,9 +910,16 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
 
         buf[0] = hdr[0];
         buf[1] = hdr[1];
-        n = recv(client_fd, &buf[2], pkt_len, MSG_WAITALL);
-        if (n != pkt_len) {
-            fprintf(stderr, "[EV3 COM] Incomplete body read (n=%d, expected=%d)\n", n, pkt_len);
+        int received = 0;
+        while (received < pkt_len) {
+            int r = recv(client_fd, &buf[2 + received], pkt_len - received, 0);
+            if (r <= 0) {
+                break;
+            }
+            received += r;
+        }
+        if (received != pkt_len) {
+            fprintf(stderr, "[EV3 COM] Incomplete body read (n=%d, expected=%d)\n", received, pkt_len);
             break;
         }
         buf[2 + pkt_len] = '\0';
@@ -894,12 +935,31 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
 
         /* CLOSE_FILEHANDLE (0x98):
          * Guest lms2012 automatically closes the file and frees the handle at EOF
-         * during CONTINUE_DOWNLOAD (0x93). Forwarding 0x98 to guest causes it to drop
-         * the packet and ev3_usb_send_packet to time out after 2000ms.
-         * Reply SUCCESS directly to PC software immediately.
+         * during CONTINUE_DOWNLOAD (0x93). Reply SUCCESS directly to PC software immediately.
          */
         if (cmd_type == 0x01 && buf[5] == 0x98) {
             unsigned char h = buf[6];
+            if (h < 8 && file_handles[h] > 0) {
+                close(file_handles[h]);
+                file_handles[h] = 0;
+            }
+            /* Sync file to EV3 guest at /mnt/ramdisk/prjs/<Project>/<Program> */
+            if (h < 8 && file_safe_paths[h][0] != '\0') {
+                FILE *fp = fopen(file_safe_paths[h], "rb");
+                if (fp) {
+                    fseek(fp, 0, SEEK_END);
+                    long fsz = ftell(fp);
+                    fseek(fp, 0, SEEK_SET);
+                    void *fdata = malloc(fsz);
+                    if (fdata) {
+                        if (fread(fdata, 1, fsz, fp) == (size_t)fsz) {
+                            ev3_sync_to_guest('F', ev3_clean_relpath(file_ev3_paths[h]), fdata, fsz);
+                        }
+                        free(fdata);
+                    }
+                    fclose(fp);
+                }
+            }
             fprintf(stderr, "[EV3 COM] Intercepted CLOSE_FILEHANDLE (handle=%d), replied SUCCESS (0ms)\n", h);
             unsigned char rep[8] = {
                 0x06, 0x00,
@@ -983,12 +1043,15 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
             continue;
         }
 
-        /* Direct commands: forward short queries (<= 32 bytes) to guest LMS2012 with fast 40ms timeout */
-        if ((cmd_type == 0x00 || cmd_type == 0x80) && pkt_len <= 32) {
+        /* Direct commands: forward short queries (<= 32 bytes) to guest LMS2012
+         * Skip opUI_WRITE WRITE_FLUSH (82 0f 0a) which takes >80ms in guest and only needs 5-byte SUCCESS.
+         */
+        if ((cmd_type == 0x00 || cmd_type == 0x80) && pkt_len <= 32 &&
+            !(pkt_len == 8 && buf[7] == 0x82 && buf[8] == 0x0F)) {
             bool has_reply = (cmd_type == 0x00);
             uint8_t rep_buf[2048];
             size_t rep_sz = 0;
-            if (ev3_usb_send_packet(buf, 2 + pkt_len, has_reply ? rep_buf : NULL, has_reply ? &rep_sz : NULL, 40)) {
+            if (ev3_usb_send_packet(buf, 2 + pkt_len, has_reply ? rep_buf : NULL, has_reply ? &rep_sz : NULL, 80)) {
                 if (has_reply && rep_sz > 0) {
                     /* If guest returned error or short reply, sanitize to successful reply */
                     int num_globals = (buf[5] | ((buf[6] & 0x03) << 8));
@@ -999,30 +1062,25 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                             while (rep_sz < (size_t)(5 + num_globals)) {
                                 rep_buf[rep_sz++] = 0;
                             }
-                            /* If battery status requested (0x81 0x01 / 0x81 0x1E) */
-                            if (num_globals >= 16) {
+                            /* Only sanitize battery status if this is a battery query (0x81 0x01) */
+                            if (pkt_len >= 7 && buf[7] == 0x81 && buf[8] == 0x01 && num_globals >= 16) {
                                 float vbatt = 8.0f;
-                                float tbatt = 25.0f;
                                 memcpy(&rep_buf[5], &vbatt, 4);
-                                memcpy(&rep_buf[9], &tbatt, 4);
                             }
                         }
                         uint16_t new_len = rep_sz - 2;
                         rep_buf[0] = new_len & 0xFF;
                         rep_buf[1] = (new_len >> 8) & 0xFF;
                     }
-                    /* Ensure firmware string is V1.09E if present */
+                    /* Replace older firmware strings (V1.03H / V1.04H / V1.06H) with V1.09E */
                     for (size_t s = 0; s + 6 <= rep_sz; s++) {
-                        if (memcmp(&rep_buf[s], "V1.06H", 6) == 0) {
+                        if (rep_buf[s] == 'V' && rep_buf[s + 1] == '1' && rep_buf[s + 2] == '.' &&
+                            rep_buf[s + 3] == '0' && rep_buf[s + 5] == 'H') {
                             memcpy(&rep_buf[s], "V1.09E", 6);
                         }
                     }
                     send(client_fd, rep_buf, rep_sz, MSG_NOSIGNAL);
-                    fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes, status=0x%02x): ", rep_sz, rep_buf[4]);
-                    for (size_t ri = 0; ri < rep_sz; ri++) {
-                        fprintf(stderr, "%02x ", rep_buf[ri]);
-                    }
-                    fprintf(stderr, "\n");
+                    fprintf(stderr, "[EV3 COM] Guest LMS2012 Replied (%zu bytes, status=0x%02x)\n", rep_sz, rep_buf[4]);
                 }
                 continue;
             }
@@ -1055,11 +1113,21 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                 int fd = open(safe_path, O_CREAT | O_WRONLY | O_TRUNC, 0755);
                 if (fd >= 0) {
                     file_handles[h] = fd;
+                    guest_file_handles[h] = 0;
                     snprintf(file_ev3_paths[h], sizeof(file_ev3_paths[h]), "%.1000s", filename);
                     snprintf(file_safe_paths[h], sizeof(file_safe_paths[h]), "%.1000s", safe_path);
 
-                    /* Also forward BEGIN_DOWNLOAD to guest LMS2012 via d_usbdev so guest writes it to /mnt/ramdisk/prjs/ */
-                    ev3_usb_send_packet(buf, 2 + pkt_len, NULL, NULL, 0);
+                    /* Forward BEGIN_DOWNLOAD synchronously to guest LMS2012 via d_usbdev so
+                     * unmodified EV3.cramfs.bin writes the file to /mnt/ramdisk/prjs/ and
+                     * consume the reply so no stale reply remains in d_usbdev.
+                     */
+                    uint8_t g_rep[256];
+                    size_t g_rep_sz = 0;
+                    if (ev3_usb_send_packet(buf, 2 + pkt_len, g_rep, &g_rep_sz, 500) && g_rep_sz >= 8) {
+                        guest_file_handles[h] = g_rep[7];
+                        fprintf(stderr, "[EV3 COM] Guest BEGIN_DOWNLOAD ok (status=0x%02x, guest_handle=%u)\n",
+                                g_rep[6], guest_file_handles[h]);
+                    }
 
                     if (cmd_type == 0x01) {
                         unsigned char rep[8] = {
@@ -1089,8 +1157,18 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     }
                 }
 
-                /* Also forward CONTINUE_DOWNLOAD to guest LMS2012 via d_usbdev */
-                ev3_usb_send_packet(buf, 2 + pkt_len, NULL, NULL, 0);
+                /* Forward CONTINUE_DOWNLOAD synchronously to guest LMS2012 with guest's handle */
+                if (h < 8) {
+                    unsigned char g_buf[1024];
+                    memcpy(g_buf, buf, 2 + pkt_len);
+                    g_buf[6] = guest_file_handles[h];
+                    uint8_t g_rep[256];
+                    size_t g_rep_sz = 0;
+                    if (ev3_usb_send_packet(g_buf, 2 + pkt_len, g_rep, &g_rep_sz, 500) && g_rep_sz >= 8) {
+                        fprintf(stderr, "[EV3 COM] Guest CONTINUE_DOWNLOAD ok (status=0x%02x, guest_handle=%u)\n",
+                                g_rep[6], g_rep[7]);
+                    }
+                }
 
                 if (cmd_type == 0x01) {
                     unsigned char rep[8] = {
@@ -1395,7 +1473,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                         pc += cons;
                         if (is_g && dest >= 0 && dest < (int)sizeof(globals)) {
                             /* EV3 lms2012 program status: 0x00 = IDLE/NONE, 0x10 = RUNNING, 0x12 = STOPPED */
-                            globals[dest] = is_prg_running ? 0x10 : 0x00;
+                            globals[dest] = g_is_prg_running ? 0x10 : 0x00;
                         }
                     }
                 } else if (op == 0x02) {
@@ -1403,8 +1481,8 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     int slot = 0, cons = 0;
                     bool is_g = false;
                     if (ev3_decode_par(&bc[pc], bc_len - pc, &slot, &is_g, &cons) == 0) pc += cons;
-                    if (slot > 0) {
-                        is_prg_running = false;
+                    if (slot == 1) {
+                        g_is_prg_running = false;
                         fprintf(stderr, "[EV3 COM] opPROGRAM_STOP (slot %d)\n", slot);
                         if (sp && sp->lcd_led[0]) {
                             qemu_set_irq(sp->lcd_led[0], 0);
@@ -1445,6 +1523,10 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                             if (is_g && dest >= 0 && dest + 4 <= (int)sizeof(globals)) {
                                 float v = 8.0f;
                                 memcpy(&globals[dest], &v, 4);
+                            }
+                            if (dest >= 0 && dest + 8 <= (int)sizeof(globals)) {
+                                float t = 25.0f;
+                                memcpy(&globals[dest + 4], &t, 4);
                             }
                         }
                         break;
@@ -1487,6 +1569,24 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                             }
                         }
                         break;
+                    case 0x1D: /* GET_SDCARD: state (PAR8), total (PAR32), free (PAR32) */
+                    case 0x1E: /* GET_USBSTICK: state (PAR8), total (PAR32), free (PAR32) */
+                        {
+                            int dest1 = 0, dest2 = 0, dest3 = 0;
+                            if (ev3_decode_par(&bc[pc], bc_len - pc, &dest1, &is_g, &cons) == 0) {
+                                pc += cons;
+                                if (is_g && dest1 >= 0 && dest1 < (int)sizeof(globals)) globals[dest1] = 0;
+                            }
+                            if (ev3_decode_par(&bc[pc], bc_len - pc, &dest2, &is_g, &cons) == 0) {
+                                pc += cons;
+                                if (is_g && dest2 >= 0 && dest2 + 4 <= (int)sizeof(globals)) memset(&globals[dest2], 0, 4);
+                            }
+                            if (ev3_decode_par(&bc[pc], bc_len - pc, &dest3, &is_g, &cons) == 0) {
+                                pc += cons;
+                                if (is_g && dest3 >= 0 && dest3 + 4 <= (int)sizeof(globals)) memset(&globals[dest3], 0, 4);
+                            }
+                        }
+                        break;
                     default:
                         break;
                     }
@@ -1519,14 +1619,14 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     if (ev3_decode_par(&bc[pc], bc_len - pc, &dest_total, &is_g, &cons) == 0) {
                         pc += cons;
                         if (is_g && dest_total >= 0 && dest_total + 4 <= (int)sizeof(globals)) {
-                            uint32_t total = 16384;
+                            uint32_t total = 59328;
                             memcpy(&globals[dest_total], &total, 4);
                         }
                     }
                     if (ev3_decode_par(&bc[pc], bc_len - pc, &dest_free, &is_g, &cons) == 0) {
                         pc += cons;
                         if (is_g && dest_free >= 0 && dest_free + 4 <= (int)sizeof(globals)) {
-                            uint32_t free_mem = 12288;
+                            uint32_t free_mem = 45056;
                             memcpy(&globals[dest_free], &free_mem, 4);
                         }
                     }
@@ -1603,6 +1703,21 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                         if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
                         if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
                     }
+                } else if (op == 0x9D) {
+                    /* opINPUT_READSI: LAYER, NO, TYPE, MODE, DEST */
+                    int layer = 0, no = 0, type = 0, mode = 0, dest = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &no, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &type, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &mode, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                        pc += cons;
+                        if (is_g && dest >= 0 && dest + 4 <= (int)sizeof(globals)) {
+                            float val = 0.0f;
+                            memcpy(&globals[dest], &val, 4);
+                        }
+                    }
                 } else if (op == 0xA0) {
                     /* opOUTPUT_GET_TYPE: LAYER, NO, TYPE_DEST */
                     int layer = 0, no = 0, type_dest = 0, cons = 0;
@@ -1664,30 +1779,56 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     stop_arg->dur_ms = dur ? dur : 300;
                     QemuThread th;
                     qemu_thread_create(&th, "ev3-tone-stop", ev3_tone_stop_worker, stop_arg, QEMU_THREAD_DETACHED);
-                } else if (op == 0x82 && pc < bc_len && bc[pc] == 0x1B) {
-                    /* opUI_WRITE LED: pattern */
-                    pc++;
-                    int pat = 0, cons = 0;
+                } else if (op == 0x8F) {
+                    /* opTIMER_READ_US: dest (OUT32) */
+                    int dest = 0, cons = 0;
                     bool is_g = false;
-                    if (ev3_decode_par(&bc[pc], bc_len - pc, &pat, &is_g, &cons) == 0) pc += cons;
-                    bool rl = false, gl = false, rr = false, gr = false;
-                    switch (pat) {
-                    case 1: gl = gr = true; break; /* green */
-                    case 2: rl = rr = true; break; /* red */
-                    case 3: rl = gl = rr = gr = true; break; /* orange */
-                    case 4: gl = gr = true; break; /* flash green */
-                    case 5: rl = rr = true; break; /* flash red */
-                    case 6: rl = gl = rr = gr = true; break; /* flash orange */
-                    case 7: gl = gr = true; break; /* pulse green */
-                    case 8: rl = rr = true; break; /* pulse red */
-                    case 9: rl = gl = rr = gr = true; break; /* pulse orange */
-                    default: break; /* off */
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &dest, &is_g, &cons) == 0) {
+                        pc += cons;
+                        if (is_g && dest >= 0 && dest + 4 <= (int)sizeof(globals)) {
+                            uint32_t us = (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) & 0xFFFFFFFF);
+                            memcpy(&globals[dest], &us, 4);
+                        }
                     }
-                    if (sp->lcd_led[0]) {
-                        qemu_set_irq(sp->lcd_led[0], rl);
-                        qemu_set_irq(sp->lcd_led[1], gl);
-                        qemu_set_irq(sp->lcd_led[2], rr);
-                        qemu_set_irq(sp->lcd_led[3], gr);
+                } else if (op == 0xA3) {
+                    /* opOUTPUT_STOP: LAYER, NOS, BRAKE */
+                    int layer = 0, nos = 0, brake = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &layer, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &nos, &is_g, &cons) == 0) pc += cons;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &brake, &is_g, &cons) == 0) pc += cons;
+                } else if (op == 0x82) {
+                    /* opUI_WRITE */
+                    int sub = 0, cons = 0;
+                    bool is_g = false;
+                    if (ev3_decode_par(&bc[pc], bc_len - pc, &sub, &is_g, &cons) == 0) {
+                        pc += cons;
+                        if (sub == 0x0F) {
+                            /* WRITE_FLUSH: no arguments */
+                        } else if (sub == 0x1B) {
+                            /* WRITE_LED: pattern */
+                            int pat = 0;
+                            if (ev3_decode_par(&bc[pc], bc_len - pc, &pat, &is_g, &cons) == 0) pc += cons;
+                            bool rl = false, gl = false, rr = false, gr = false;
+                            switch (pat) {
+                            case 1: gl = gr = true; break; /* green */
+                            case 2: rl = rr = true; break; /* red */
+                            case 3: rl = gl = rr = gr = true; break; /* orange */
+                            case 4: gl = gr = true; break; /* flash green */
+                            case 5: rl = rr = true; break; /* flash red */
+                            case 6: rl = gl = rr = gr = true; break; /* flash orange */
+                            case 7: gl = gr = true; break; /* pulse green */
+                            case 8: rl = rr = true; break; /* pulse red */
+                            case 9: rl = gl = rr = gr = true; break; /* pulse orange */
+                            default: break; /* off */
+                            }
+                            if (sp && sp->lcd_led[0]) {
+                                qemu_set_irq(sp->lcd_led[0], rl);
+                                qemu_set_irq(sp->lcd_led[1], gl);
+                                qemu_set_irq(sp->lcd_led[2], rr);
+                                qemu_set_irq(sp->lcd_led[3], gr);
+                            }
+                        }
                     }
                 } else if (op == 0xC0) {
                     /* opFILE */
@@ -1739,8 +1880,8 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                             }
                             fclose(fp);
                         }
-                    } else if (sub == 0x09 || sub == 0x0C) {
-                        /* GET_IMAGE: slot, ip_dest */
+                    } else if (sub == 0x09 || sub == 0x0B) {
+                        /* GET_IMAGE / GET_POOL: slot/hash, ip_dest */
                         int slot = 0, ip_dest = 0;
                         if (ev3_decode_par(&bc[pc], bc_len - pc, &slot, &is_g, &cons) == 0) pc += cons;
                         if (ev3_decode_par(&bc[pc], bc_len - pc, &ip_dest, &is_g, &cons) == 0) pc += cons;
@@ -1748,6 +1889,11 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                             uint32_t fake_ip = 0x00010000;
                             memcpy(&globals[ip_dest], &fake_ip, 4);
                         }
+                    } else if (sub == 0x0C) {
+                        /* SET_LOG_SYNC_TIME: time (IN32), tick (IN32) */
+                        int sync_time = 0, sync_tick = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &sync_time, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &sync_tick, &is_g, &cons) == 0) pc += cons;
                     } else if (sub == 0x0A) {
                         /* GET_ITEM: slot, item, val_dest */
                         int slot = 0, item = 0, val_dest = 0;
@@ -1777,6 +1923,15 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                         /* REMOVE_SUBFOLDERS: name */
                         const char *path = "";
                         if (ev3_decode_str(&bc[pc], bc_len - pc, &path, &cons) == 0) pc += cons;
+                    } else if (sub == 0x0F) {
+                        /* GET_SUBFOLDER_NAME: item, name_dest, length, subfolders_left */
+                        int item = 0, name_dest = 0, length = 0, sub_left_dest = 0;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &item, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &name_dest, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &length, &is_g, &cons) == 0) pc += cons;
+                        if (ev3_decode_par(&bc[pc], bc_len - pc, &sub_left_dest, &is_g, &cons) == 0) pc += cons;
+                        if (name_dest >= 0 && name_dest < (int)sizeof(globals)) globals[name_dest] = '\0';
+                        if (sub_left_dest >= 0 && sub_left_dest < (int)sizeof(globals)) globals[sub_left_dest] = 0;
                     } else {
                         fprintf(stderr, "[EV3 COM] opFILE: unhandled subcode 0x%02X\n", sub);
                     }
@@ -1790,7 +1945,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                     if (ev3_decode_par(&bc[pc], bc_len - pc, &debug, &is_g, &cons) == 0) pc += cons;
 
                     if (slot == 1) {
-                        is_prg_running = true;
+                        g_is_prg_running = true;
                         fprintf(stderr, "[EV3 COM] opPROGRAM_START: user program slot=%d size=%d ip=%d debug=%d\n",
                                 slot, size, ip, debug);
 
@@ -1801,7 +1956,7 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
                             sp->sound.enabled = true;
                             ToneStopArg *stop_arg = g_new0(ToneStopArg, 1);
                             stop_arg->sp = sp;
-                            stop_arg->dur_ms = 250;
+                            stop_arg->dur_ms = 400;
                             QemuThread th;
                             qemu_thread_create(&th, "ev3-tone-stop", ev3_tone_stop_worker, stop_arg, QEMU_THREAD_DETACHED);
                             if (sp->lcd_led[0]) {
@@ -1844,7 +1999,9 @@ static void ev3_handle_client(DA850SimplePeripherals *sp, int client_fd)
     if (g_current_client_fd == client_fd) {
         g_current_client_fd = -1;
     }
+    shutdown(client_fd, SHUT_RDWR);
     close(client_fd);
+    g_is_prg_running = false;
     fprintf(stderr, "[EV3 COM] Client disconnected (fd=%d)\n", client_fd);
 }
 
